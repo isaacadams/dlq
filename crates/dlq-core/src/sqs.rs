@@ -8,10 +8,9 @@ pub async fn list() {
     dbg!(queues);
 }
 
-pub async fn poll() {
+pub async fn poll(url: Option<&str>) {
     let dlq = DeadLetterQueue::new().await;
-    let queue_url = env!("DLQ_URL");
-    dlq.poll(queue_url).await;
+    dlq.poll(url).await;
 }
 
 pub async fn receive(
@@ -35,13 +34,19 @@ pub async fn receive(
 struct DeadLetterQueue {
     pub config: SdkConfig,
     pub client: sqs::Client,
+    pub default_queue_url: Option<String>,
 }
 
 impl DeadLetterQueue {
     pub async fn new() -> Self {
         let config = aws_config::load_from_env().await;
         let client = aws_sdk_sqs::Client::new(&config);
-        Self { config, client }
+
+        Self {
+            config,
+            client,
+            default_queue_url: std::env::var("DLQ_URL").ok(),
+        }
     }
 
     pub async fn list(&self) -> Vec<String> {
@@ -69,9 +74,12 @@ impl DeadLetterQueue {
         queues
     }
 
-    pub async fn poll(&self, queue_url: &str) {
+    pub async fn poll(&self, queue_url: Option<&str>) {
+        let url = queue_url
+            .or(self.default_queue_url.as_deref())
+            .expect("failed: queue url was not specified");
         loop {
-            let output = receive(&self.client, queue_url).await.unwrap();
+            let output = receive(&self.client, url).await.unwrap();
 
             // if none, that suggests the whole queue has been received recently
             let Some(messages) = output.messages else {

@@ -25,7 +25,7 @@ impl Cli {
     pub async fn run(self) -> anyhow::Result<()> {
         match self.command {
             Commands::List => dlq::list().await,
-            Commands::Poll { url: _ } => dlq::poll().await,
+            Commands::Poll { url } => dlq::poll(url.as_deref()).await,
         };
 
         Ok(())
