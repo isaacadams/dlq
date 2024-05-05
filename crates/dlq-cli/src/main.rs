@@ -18,7 +18,11 @@ pub struct Cli {
 #[derive(Debug, Subcommand)]
 enum Commands {
     List,
-    Poll { url: Option<String> },
+    Poll {
+        /// the url of your dead letter queue
+        /// ( can optionally be set via environment variable DLQ_URL=... )
+        url: Option<String>,
+    },
 }
 
 impl Cli {
