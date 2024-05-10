@@ -5,6 +5,7 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT"
 description = "a CLI tool for polling the messages from your AWS DLQ instance"
+repository = "https://github.com/isaacadams/dlq"
 
 [[bin]]
 name = "dlq"
