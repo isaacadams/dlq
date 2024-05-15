@@ -1,0 +1,18 @@
+services:
+  localstack:
+    image: localstack/localstack:latest
+    container_name: aws
+    healthcheck:
+      test: awslocal sqs list-queues
+      interval: 30s
+      timeout: 60s
+    ports:
+      - '127.0.0.1:4566:4566' # LocalStack Gateway
+      - '127.0.0.1:4510-4559:4510-4559' # external services port range
+    environment:
+      - HOSTNAME_EXTERNAL=localstack
+      - SERVICES=sqs:4576,s3
+      - DEBUG=1
+    volumes:
+      - '${LOCALSTACK_VOLUME_DIR:-./.localstack}:/var/lib/localstack'
+      - '/var/run/docker.sock:/var/run/docker.sock'
