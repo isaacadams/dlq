@@ -5,6 +5,7 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT"
 description = "a CLI tool for polling the messages from your AWS DLQ instance"
+repository = "https://github.com/isaacadams/dlq"
 
 [[bin]]
 name = "dlq"
@@ -22,3 +23,7 @@ log = "0.4"
 env_logger = "0.11"
 dlq-core = { version = "0.1.0", path = "../dlq-core" }
 clap = { version = "4.5", features = ["derive"] }
+
+[dev-dependencies]
+assert_cmd = "2.0.14"
+predicates = "3.1.0"
