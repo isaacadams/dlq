@@ -5,7 +5,7 @@ use aws_sdk_sqs as sqs;
 pub async fn list() {
     let dlq = DeadLetterQueue::new().await;
     let queues = dlq.list().await;
-    dbg!(queues);
+    println!("{}", queues.join(","));
 }
 
 pub async fn poll(url: Option<&str>) {

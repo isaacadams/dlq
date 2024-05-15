@@ -1,5 +1,8 @@
 use clap::{Parser, Subcommand};
 
+#[cfg(test)]
+mod test;
+
 #[tokio::main]
 pub async fn main() {
     if let Err(e) = Cli::parse().run().await {
