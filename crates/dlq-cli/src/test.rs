@@ -43,11 +43,12 @@ async fn create_test_queue(
         "test-queue",
     ])
     .with_container_ready_conditions(vec![testcontainers::core::WaitFor::message_on_stdout(
-        "Ready.",
+        "AWS sqs.CreateQueue => 200",
     )]);
 
+    let mut output = container.exec(create_queue_command).await?;
+
     if debug {
-        let mut output = container.exec(create_queue_command).await?;
         let mut stdout = String::new();
         let mut stderr = String::new();
         output.stdout().read_to_string(&mut stdout).await.unwrap();
