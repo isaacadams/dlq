@@ -102,3 +102,64 @@ async fn list_queues() {
 
     ()
 }
+
+#[tokio::test]
+async fn poll_queue() {
+    let container = localstack().await.unwrap();
+    let host_port = container.get_host_port_ipv4(4566).await.unwrap();
+    setup_localstack_env(host_port);
+    create_test_queue(&container, false).await.unwrap();
+    let queue_url =
+        format!("http://sqs.us-east-1.localhost.localstack.cloud:4566/000000000000/test-queue");
+    send_messages_to_queue(&queue_url, 10).await.unwrap();
+
+    let mut cmd = Command::cargo_bin("dlq").unwrap();
+
+    cmd.arg("poll");
+    cmd.arg(&queue_url);
+
+    cmd.assert().success().stdout(
+        predicate::str::contains(r#""body":"Test message 0""#)
+            .and(predicate::str::contains(r#""body":"Test message 1""#))
+            .and(predicate::str::contains(r#""body":"Test message 2""#))
+            .and(predicate::str::contains(r#""body":"Test message 3""#))
+            .and(predicate::str::contains(r#""body":"Test message 4""#))
+            .and(predicate::str::contains(r#""body":"Test message 5""#))
+            .and(predicate::str::contains(r#""body":"Test message 6""#))
+            .and(predicate::str::contains(r#""body":"Test message 7""#))
+            .and(predicate::str::contains(r#""body":"Test message 8""#))
+            .and(predicate::str::contains(r#""body":"Test message 9""#)),
+    );
+
+    ()
+}
+
+async fn send_messages_to_queue(
+    queue_url: &str,
+    num_messages: i32,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let config = aws_config::from_env().load().await;
+    let client = aws_sdk_sqs::Client::new(&config);
+
+    for batch in (0..num_messages).collect::<Vec<_>>().chunks(10) {
+        let entries: Vec<aws_sdk_sqs::types::SendMessageBatchRequestEntry> = batch
+            .iter()
+            .map(|i| {
+                aws_sdk_sqs::types::SendMessageBatchRequestEntry::builder()
+                    .id(format!("msg_{}", i))
+                    .message_body(format!("Test message {}", i))
+                    .build()
+                    .unwrap()
+            })
+            .collect();
+
+        client
+            .send_message_batch()
+            .queue_url(queue_url)
+            .set_entries(Some(entries))
+            .send()
+            .await?;
+    }
+
+    Ok(())
+}
