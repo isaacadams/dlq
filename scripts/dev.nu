@@ -12,7 +12,7 @@ def main [] {
 # Generate a batch of test messages in SQS batch format
 # > nu scripts/dev.nu generate messages 3
 def "main generate messages" [batches: int = 3] {
-    seq 1 $batches | each {|i|
+    seq 1 $batches | each { |i|
         [
             (message $"($i)_a")
             (message $"($i)_b")
@@ -39,7 +39,7 @@ def "main send messages" [
     main generate messages $batch
         | chunks 10 # can only send 10 at a time to sqs
         | each {|batch|
-            let entries = ($batch | to json)
+            let entries = ($batch | each { $in | from json }) | to json -r
             aws sqs send-message-batch --queue-url $queue_url --entries $entries
         }
 }
