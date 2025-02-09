@@ -9,8 +9,8 @@ dev:
     mkdir -p .localstack
     docker compose up -d
     just awslocal sqs create-queue --queue-name test
-    just generate_messages 100 | \
-    just load_test_events http://sqs.us-east-1.localhost.localstack.cloud:4566/000000000000/test
+    #just generate_messages 100 | \
+    #just load_test_events http://sqs.us-east-1.localhost.localstack.cloud:4566/000000000000/test
 
 create_queue:
     just awslocal sqs create-queue --queue-name test
