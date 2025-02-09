@@ -29,7 +29,7 @@ def message [id] {
 
 # Send messages to the SQS queue in LocalStack
 # Example usage:
-# > nu scripts/dev.nu send messages 3 test
+# > nu scripts/dev.nu send messages 100 test
 def "main send messages" [
     batch: int = 3,                      # Number of batch messages to send
     queue_name: string = "test"          # Name of the queue
@@ -38,7 +38,7 @@ def "main send messages" [
 
     main generate messages $batch
         | chunks 10 # can only send 10 at a time to sqs
-        | each {|batch|
+        | par-each {|batch|
             let entries = ($batch | each { $in | from json }) | to json -r
             aws sqs send-message-batch --queue-url $queue_url --entries $entries
         }
