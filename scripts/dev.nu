@@ -1,12 +1,12 @@
 $env.AWS_ENDPOINT_URL = "http://localhost:4566"
 
-# AWS_ENDPOINT_URL=http://localhost:4566 cargo run poll
-# AWS_ENDPOINT_URL=http://localhost:4566 cargo run poll http://sqs.us-east-1.localhost.localstack.cloud:4566/000000000000/test | lines | each { $in | from json } | into sqlite queue.db -t test
-
+# > nu scripts/dev.nu
 def main [] {
+    docker compose down
     mkdir .localstack
     docker compose up -d
     aws sqs create-queue --queue-name test
+    main send messages 100 test
 }
 
 # Generate a batch of test messages in SQS batch format
@@ -42,17 +42,4 @@ def "main send messages" [
             let entries = ($batch | each { $in | from json }) | to json -r
             aws sqs send-message-batch --queue-url $queue_url --entries $entries
         }
-}
-
-def "main test get" [name] {
-    aws sqs get-queue-url --queue-name $name
-}
-
-# > nu scripts/dev.nu test poll
-def "main test poll" [] {
-    open queue.db | query db "drop table test;"
-    cargo run poll http://sqs.us-east-1.localhost.localstack.cloud:4566/000000000000/test 
-        | lines 
-        | each { $in | from json } 
-        | into sqlite queue.db -t test
 }
