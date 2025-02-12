@@ -21,6 +21,7 @@ async fn localstack() -> Result<(String, ContainerAsync<LocalStack>), Testcontai
 
 async fn create_test_queue<I: Image>(
     container: &ContainerAsync<I>,
+    name: &str,
     debug: bool,
 ) -> Result<(), TestcontainersError> {
     let create_queue_command = testcontainers::core::ExecCommand::new([
@@ -28,7 +29,7 @@ async fn create_test_queue<I: Image>(
         "sqs",
         "create-queue",
         "--queue-name",
-        "test-queue",
+        name,
     ])
     .with_container_ready_conditions(vec![testcontainers::core::WaitFor::message_on_stdout(
         "AWS sqs.CreateQueue => 200",
@@ -74,7 +75,9 @@ async fn list_queues() {
     let (endpoint, container) = localstack().await.unwrap();
 
     setup_localstack_env(&endpoint);
-    create_test_queue(&container, false).await.unwrap();
+    create_test_queue(&container, "test-queue", false)
+        .await
+        .unwrap();
 
     let mut cmd = Command::cargo_bin("dlq").unwrap();
 
@@ -93,7 +96,9 @@ async fn poll_queue() {
     let (endpoint, container) = localstack().await.unwrap();
 
     setup_localstack_env(&endpoint);
-    create_test_queue(&container, false).await.unwrap();
+    create_test_queue(&container, "test-queue", false)
+        .await
+        .unwrap();
     let queue_url =
         format!("http://sqs.us-east-1.localhost.localstack.cloud:4566/000000000000/test-queue");
     send_messages_to_queue(&queue_url, 11).await.unwrap();
