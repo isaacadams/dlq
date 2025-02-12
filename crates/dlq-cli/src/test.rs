@@ -83,6 +83,8 @@ async fn list_queues() {
         "http://sqs.us-east-1.localhost.localstack.cloud:4566/000000000000/test-queue",
     ));
 
+    container.stop().await.unwrap();
+
     ()
 }
 
@@ -114,6 +116,8 @@ async fn poll_queue() {
             .and(predicate::str::contains(r#""body":"Test message 9""#))
             .and(predicate::str::contains(r#""body":"Test message 10""#)),
     );
+
+    container.stop().await.unwrap();
 
     ()
 }
