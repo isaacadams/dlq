@@ -27,3 +27,4 @@ clap = { version = "4.5", features = ["derive"] }
 assert_cmd = "2.0"
 predicates = "3.1"
 testcontainers = "0.23"
+testcontainers-modules = { version = "0.11.6", features = ["localstack"] }

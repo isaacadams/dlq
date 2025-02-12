@@ -14,6 +14,17 @@ pub async fn poll(url: Option<&str>) {
     dlq.poll(url).await;
 }
 
+pub async fn info() {
+    let config = aws_config::load_from_env().await;
+    println!(
+        "{:#}",
+        serde_json::json!({
+            "endpoint": config.endpoint_url(),
+            "region": config.region().map(|x| x.to_string())
+        })
+    );
+}
+
 pub async fn receive(
     client: &aws_sdk_sqs::Client,
     queue_url: &str,
@@ -95,13 +106,24 @@ impl DeadLetterQueue {
         let url = queue_url
             .or(self.default_queue_url.as_deref())
             .expect("failed: queue url was not specified");
+        let max_tries = 10;
+        let mut tries = 0;
         loop {
+            tries += 1;
+            if tries > max_tries {
+                return;
+            }
+
             let output = receive(&self.client, url).await.unwrap();
 
             // if none, that suggests the whole queue has been received recently
             let Some(messages) = output.messages else {
                 return;
             };
+
+            if messages.is_empty() {
+                return;
+            }
 
             for m in messages {
                 println!(

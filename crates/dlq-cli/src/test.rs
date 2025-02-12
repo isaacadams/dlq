@@ -1,40 +1,28 @@
 use assert_cmd::prelude::*;
 use predicates::prelude::*;
 use std::process::Command;
-use testcontainers::GenericImage;
+use testcontainers::ContainerAsync;
+use testcontainers_modules::{
+    localstack::LocalStack,
+    testcontainers::{runners::AsyncRunner, Image, ImageExt, TestcontainersError},
+};
 use tokio::io::AsyncReadExt;
 
-async fn localstack(
-) -> Result<testcontainers::ContainerAsync<GenericImage>, testcontainers::TestcontainersError> {
-    use testcontainers::{
-        core::{ContainerPort, Mount, WaitFor},
-        runners::AsyncRunner,
-        GenericImage, ImageExt,
-    };
+async fn localstack() -> Result<(String, ContainerAsync<LocalStack>), TestcontainersError> {
+    let request = LocalStack::default().with_env_var("SERVICES", "sqs:4576,s3");
+    let container = request.start().await?;
 
-    GenericImage::new("localstack/localstack", "latest")
-        // Wait condition - using healthcheck equivalent
-        .with_wait_for(WaitFor::message_on_stdout("Ready."))
-        // Port mappings
-        .with_exposed_port(ContainerPort::Tcp(4566))
-        //.with_exposed_port_range(ContainerPort::Tcp(4510)..=ContainerPort::Tcp(4559))
-        // Environment variables
-        .with_env_var("HOSTNAME_EXTERNAL", "localstack")
-        .with_env_var("SERVICES", "sqs:4576,s3")
-        .with_env_var("DEBUG", "1")
-        // Volume mounts
-        .with_mount(Mount::bind_mount(
-            "/var/run/docker.sock",
-            "/var/run/docker.sock",
-        ))
-        .start()
-        .await
+    let host_ip = container.get_host().await?;
+    let host_port = container.get_host_port_ipv4(4566).await?;
+    let endpoint_url = format!("http://{host_ip}:{host_port}");
+
+    Ok((endpoint_url, container))
 }
 
-async fn create_test_queue(
-    container: &testcontainers::ContainerAsync<GenericImage>,
+async fn create_test_queue<I: Image>(
+    container: &ContainerAsync<I>,
     debug: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), TestcontainersError> {
     let create_queue_command = testcontainers::core::ExecCommand::new([
         "awslocal",
         "sqs",
@@ -62,11 +50,8 @@ async fn create_test_queue(
     Ok(())
 }
 
-fn setup_localstack_env(host_port: u16) {
-    std::env::set_var(
-        "AWS_ENDPOINT_URL",
-        format!("http://localhost:{}", host_port),
-    );
+fn setup_localstack_env(endpoint_url: &str) {
+    std::env::set_var("AWS_ENDPOINT_URL", endpoint_url);
     std::env::set_var("AWS_ACCESS_KEY_ID", "test");
     std::env::set_var("AWS_SECRET_ACCESS_KEY", "test");
     std::env::set_var("AWS_DEFAULT_REGION", "us-east-1");
@@ -86,11 +71,9 @@ async fn command_does_not_exist() {
 
 #[tokio::test]
 async fn list_queues() {
-    let container = localstack().await.unwrap();
+    let (endpoint, container) = localstack().await.unwrap();
 
-    // Get the actual host port that Docker mapped to the container's port
-    let host_port = container.get_host_port_ipv4(4566).await.unwrap();
-    setup_localstack_env(host_port);
+    setup_localstack_env(&endpoint);
     create_test_queue(&container, false).await.unwrap();
 
     let mut cmd = Command::cargo_bin("dlq").unwrap();
@@ -105,13 +88,13 @@ async fn list_queues() {
 
 #[tokio::test]
 async fn poll_queue() {
-    let container = localstack().await.unwrap();
-    let host_port = container.get_host_port_ipv4(4566).await.unwrap();
-    setup_localstack_env(host_port);
+    let (endpoint, container) = localstack().await.unwrap();
+
+    setup_localstack_env(&endpoint);
     create_test_queue(&container, false).await.unwrap();
     let queue_url =
         format!("http://sqs.us-east-1.localhost.localstack.cloud:4566/000000000000/test-queue");
-    send_messages_to_queue(&queue_url, 10).await.unwrap();
+    send_messages_to_queue(&queue_url, 11).await.unwrap();
 
     let mut cmd = Command::cargo_bin("dlq").unwrap();
 
@@ -128,7 +111,8 @@ async fn poll_queue() {
             .and(predicate::str::contains(r#""body":"Test message 6""#))
             .and(predicate::str::contains(r#""body":"Test message 7""#))
             .and(predicate::str::contains(r#""body":"Test message 8""#))
-            .and(predicate::str::contains(r#""body":"Test message 9""#)),
+            .and(predicate::str::contains(r#""body":"Test message 9""#))
+            .and(predicate::str::contains(r#""body":"Test message 10""#)),
     );
 
     ()
