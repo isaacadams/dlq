@@ -9,7 +9,9 @@ use testcontainers_modules::{
 use tokio::io::AsyncReadExt;
 
 async fn localstack() -> Result<(String, ContainerAsync<LocalStack>), TestcontainersError> {
-    let request = LocalStack::default().with_env_var("SERVICES", "sqs:4576,s3");
+    let request = LocalStack::default()
+        .with_env_var("SERVICES", "sqs:4576,s3")
+        .with_env_var("SKIP_SSL_CERT_DOWNLOAD", "1");
     let container = request.start().await?;
 
     let host_ip = container.get_host().await?;
