@@ -1,5 +1,8 @@
 use clap::{Parser, Subcommand};
 
+#[cfg(test)]
+mod test;
+
 #[tokio::main]
 pub async fn main() {
     if let Err(e) = Cli::parse().run().await {
@@ -17,6 +20,7 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
+    Info,
     List,
     Poll {
         /// the url of your dead letter queue
@@ -28,6 +32,7 @@ enum Commands {
 impl Cli {
     pub async fn run(self) -> anyhow::Result<()> {
         match self.command {
+            Commands::Info => dlq::info().await,
             Commands::List => dlq::list().await,
             Commands::Poll { url } => dlq::poll(url.as_deref()).await,
         };

@@ -1,16 +1,28 @@
 use anyhow::Context;
 use aws_config::SdkConfig;
 use aws_sdk_sqs as sqs;
+use sqs::types::DeleteMessageBatchRequestEntry;
 
 pub async fn list() {
     let dlq = DeadLetterQueue::new().await;
     let queues = dlq.list().await;
-    dbg!(queues);
+    println!("{}", queues.join(","));
 }
 
 pub async fn poll(url: Option<&str>) {
     let dlq = DeadLetterQueue::new().await;
     dlq.poll(url).await;
+}
+
+pub async fn info() {
+    let config = aws_config::load_from_env().await;
+    println!(
+        "{:#}",
+        serde_json::json!({
+            "endpoint": config.endpoint_url(),
+            "region": config.region().map(|x| x.to_string())
+        })
+    );
 }
 
 pub async fn receive(
@@ -22,7 +34,7 @@ pub async fn receive(
         .set_queue_url(Some(queue_url.to_string()))
         .set_max_number_of_messages(Some(10))
         .set_visibility_timeout(Some(15))
-        .set_attribute_names(Some(vec!["All".into()]))
+        .message_system_attribute_names(sqs::types::MessageSystemAttributeName::All)
         //.set_wait_time_seconds(Some(3))
         .send()
         .await;
@@ -32,7 +44,7 @@ pub async fn receive(
 
 #[derive(Clone)]
 struct DeadLetterQueue {
-    pub config: SdkConfig,
+    pub _config: SdkConfig,
     pub client: sqs::Client,
     pub default_queue_url: Option<String>,
 }
@@ -43,10 +55,26 @@ impl DeadLetterQueue {
         let client = aws_sdk_sqs::Client::new(&config);
 
         Self {
-            config,
+            _config: config,
             client,
-            default_queue_url: std::env::var("DLQ_URL").ok(),
+            default_queue_url: std::env::var("DLQ_URL")
+                .ok()
+                .or(Some(String::from("http://localhost:4566"))),
         }
+    }
+
+    pub async fn _clear(&self, url: String, message_id: String, receipt_handle: String) {
+        self.client
+            .delete_message_batch()
+            .set_queue_url(Some(url))
+            .set_entries(Some(vec![DeleteMessageBatchRequestEntry::builder()
+                .set_id(Some(message_id))
+                .set_receipt_handle(Some(receipt_handle))
+                .build()
+                .unwrap()]))
+            .send()
+            .await
+            .unwrap();
     }
 
     pub async fn list(&self) -> Vec<String> {
@@ -78,13 +106,24 @@ impl DeadLetterQueue {
         let url = queue_url
             .or(self.default_queue_url.as_deref())
             .expect("failed: queue url was not specified");
+        let max_tries = 10;
+        let mut tries = 0;
         loop {
+            tries += 1;
+            if tries > max_tries {
+                return;
+            }
+
             let output = receive(&self.client, url).await.unwrap();
 
             // if none, that suggests the whole queue has been received recently
             let Some(messages) = output.messages else {
                 return;
             };
+
+            if messages.is_empty() {
+                return;
+            }
 
             for m in messages {
                 println!(
@@ -119,14 +158,5 @@ impl MessageModel {
             attributes: None,         //value.attributes,
             message_attributes: None, //value.message_attributes,
         }
-    }
-}
-
-mod test {
-    use super::*;
-
-    #[tokio::test]
-    async fn test_list() {
-        list().await;
     }
 }
