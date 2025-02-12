@@ -46,7 +46,9 @@ impl DeadLetterQueue {
         Self {
             _config: config,
             client,
-            default_queue_url: std::env::var("DLQ_URL").ok(),
+            default_queue_url: std::env::var("DLQ_URL")
+                .ok()
+                .or(Some(String::from("http://localhost:4566"))),
         }
     }
 
