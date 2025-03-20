@@ -1,7 +1,7 @@
 [package]
 name = "dlq"
 authors = ["Isaac Adams"]
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 license = "MIT"
 description = "a CLI tool for polling the messages from your AWS DLQ instance"
