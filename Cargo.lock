@@ -926,7 +926,7 @@ dependencies = [
 
 [[package]]
 name = "dlq"
-version = "0.1.2"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -946,7 +946,7 @@ dependencies = [
 
 [[package]]
 name = "dlq-core"
-version = "0.1.2"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "aws-config",
