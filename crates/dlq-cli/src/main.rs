@@ -1,4 +1,5 @@
 use clap::{Parser, Subcommand};
+use dlq::DeadLetterQueue;
 
 #[cfg(test)]
 mod test;
@@ -14,6 +15,18 @@ pub async fn main() {
 #[command(name = "dlq")]
 #[command(about = "aws dead letter queue CLI client written in rust", long_about = None)]
 pub struct Cli {
+    /// AWS access key ID
+    #[arg(long)]
+    access_key_id: Option<String>,
+
+    /// AWS secret access key
+    #[arg(long)]
+    secret_access_key: Option<String>,
+
+    /// AWS endpoint
+    #[arg(long)]
+    endpoint: Option<String>,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -31,12 +44,40 @@ enum Commands {
 
 impl Cli {
     pub async fn run(self) -> anyhow::Result<()> {
+        let credentials = credentials(
+            self.access_key_id.as_deref(),
+            self.secret_access_key.as_deref(),
+        );
+        let dlq = DeadLetterQueue::new(credentials, self.endpoint.as_deref()).await;
+
         match self.command {
-            Commands::Info => dlq::info().await,
-            Commands::List => dlq::list().await,
-            Commands::Poll { url } => dlq::poll(url.as_deref()).await,
+            Commands::Info => {
+                println!("endpoint: {:#?}", dlq.config.endpoint_url());
+                println!("region: {:#?}", dlq.config.region());
+                println!("behavior: {:#?}", dlq.config.behavior_version());
+                println!("credentials: {:#?}", dlq.config.credentials_provider());
+            }
+            Commands::List => {
+                let queues = dlq.list().await;
+                println!("{}", queues.join(","));
+            }
+            Commands::Poll { url } => {
+                dlq.poll(url.as_deref()).await;
+            }
         };
 
         Ok(())
+    }
+}
+
+pub fn credentials(
+    access_key_id: Option<&str>,
+    secret_access_key: Option<&str>,
+) -> Option<aws_sdk_sqs::config::Credentials> {
+    match (access_key_id, secret_access_key) {
+        (Some(key), Some(secret)) => Some(aws_sdk_sqs::config::Credentials::new(
+            key, secret, None, None, "static",
+        )),
+        _ => None,
     }
 }

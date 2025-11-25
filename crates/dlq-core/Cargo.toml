@@ -1,7 +1,7 @@
 [package]
 name = "dlq-core"
 authors = ["Isaac Adams"]
-version = "0.1.2"
+version = "1.0.0"
 edition = "2021"
 license = "MIT"
 description = "easily poll messages from your AWS DLQ instance"
@@ -16,7 +16,7 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "parking_lot"]
 aws-config = { version = "1.5", features = ["behavior-version-latest"] }
 aws-sdk-sqs = "1"
 anyhow = "1.0"
-serde_json = "1"
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 log = "0.4"
 env_logger = "0.11"

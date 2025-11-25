@@ -3,28 +3,6 @@ use aws_config::SdkConfig;
 use aws_sdk_sqs as sqs;
 use sqs::types::DeleteMessageBatchRequestEntry;
 
-pub async fn list() {
-    let dlq = DeadLetterQueue::new().await;
-    let queues = dlq.list().await;
-    println!("{}", queues.join(","));
-}
-
-pub async fn poll(url: Option<&str>) {
-    let dlq = DeadLetterQueue::new().await;
-    dlq.poll(url).await;
-}
-
-pub async fn info() {
-    let config = aws_config::load_from_env().await;
-    println!(
-        "{:#}",
-        serde_json::json!({
-            "endpoint": config.endpoint_url(),
-            "region": config.region().map(|x| x.to_string())
-        })
-    );
-}
-
 pub async fn receive(
     client: &aws_sdk_sqs::Client,
     queue_url: &str,
@@ -43,19 +21,36 @@ pub async fn receive(
 }
 
 #[derive(Clone)]
-struct DeadLetterQueue {
-    pub _config: SdkConfig,
+pub struct DeadLetterQueue {
+    pub config: SdkConfig,
     pub client: sqs::Client,
     pub default_queue_url: Option<String>,
 }
 
 impl DeadLetterQueue {
-    pub async fn new() -> Self {
-        let config = aws_config::load_from_env().await;
+    pub async fn new(
+        credentials: Option<aws_sdk_sqs::config::Credentials>,
+        endpoint: Option<&str>,
+    ) -> Self {
+        let mut loader = aws_config::from_env().region(
+            // supports loading region from known env variables
+            aws_config::meta::region::RegionProviderChain::default_provider()
+                .or_else(aws_config::Region::from_static("us-east-1")),
+        );
+
+        if let Some(x) = credentials {
+            loader = loader.credentials_provider(x);
+        }
+
+        if let Some(endpoint) = endpoint {
+            loader = loader.endpoint_url(endpoint);
+        }
+
+        let config = loader.load().await;
         let client = aws_sdk_sqs::Client::new(&config);
 
         Self {
-            _config: config,
+            config,
             client,
             default_queue_url: std::env::var("DLQ_URL")
                 .ok()

@@ -1,4 +1,5 @@
 use assert_cmd::prelude::*;
+use aws_sdk_sqs::config::Credentials;
 use predicates::prelude::*;
 use std::process::Command;
 use testcontainers::ContainerAsync;
@@ -54,13 +55,6 @@ async fn create_test_queue<I: Image>(
     Ok(())
 }
 
-fn setup_localstack_env(endpoint_url: &str) {
-    std::env::set_var("AWS_ENDPOINT_URL", endpoint_url);
-    std::env::set_var("AWS_ACCESS_KEY_ID", "test");
-    std::env::set_var("AWS_SECRET_ACCESS_KEY", "test");
-    std::env::set_var("AWS_DEFAULT_REGION", "us-east-1");
-}
-
 #[tokio::test]
 async fn command_does_not_exist() {
     let mut cmd = Command::cargo_bin("dlq").unwrap();
@@ -77,13 +71,15 @@ async fn command_does_not_exist() {
 async fn list_queues() {
     let (endpoint, container) = localstack().await.unwrap();
 
-    setup_localstack_env(&endpoint);
     create_test_queue(&container, "test-queue", false)
         .await
         .unwrap();
 
     let mut cmd = Command::cargo_bin("dlq").unwrap();
 
+    cmd.args(["--endpoint", &endpoint]);
+    cmd.args(["--access-key-id", "test"]);
+    cmd.args(["--secret-access-key", "test"]);
     cmd.arg("list");
     cmd.assert().success().stdout(predicate::str::contains(
         "http://sqs.us-east-1.localhost.localstack.cloud:4566/000000000000/test-queue",
@@ -98,16 +94,20 @@ async fn list_queues() {
 async fn poll_queue() {
     let (endpoint, container) = localstack().await.unwrap();
 
-    setup_localstack_env(&endpoint);
     create_test_queue(&container, "test-queue", false)
         .await
         .unwrap();
     let queue_url =
         format!("http://sqs.us-east-1.localhost.localstack.cloud:4566/000000000000/test-queue");
-    send_messages_to_queue(&queue_url, 11).await.unwrap();
+    send_messages_to_queue(&queue_url, 11, &endpoint)
+        .await
+        .unwrap();
 
     let mut cmd = Command::cargo_bin("dlq").unwrap();
 
+    cmd.args(["--endpoint", &endpoint]);
+    cmd.args(["--access-key-id", "test"]);
+    cmd.args(["--secret-access-key", "test"]);
     cmd.arg("poll");
     cmd.arg(&queue_url);
 
@@ -130,11 +130,19 @@ async fn poll_queue() {
     ()
 }
 
+fn local_config(endpoint_url: &str, region: Option<&'static str>) -> aws_config::ConfigLoader {
+    aws_config::defaults(aws_config::BehaviorVersion::latest())
+        .endpoint_url(endpoint_url)
+        .region(region.unwrap_or("us-east-1"))
+        .credentials_provider(Credentials::new("test", "test", None, None, "static"))
+}
+
 async fn send_messages_to_queue(
     queue_url: &str,
     num_messages: i32,
+    endpoint_url: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let config = aws_config::from_env().load().await;
+    let config = local_config(endpoint_url, None).load().await;
     let client = aws_sdk_sqs::Client::new(&config);
 
     for batch in (0..num_messages).collect::<Vec<_>>().chunks(10) {
