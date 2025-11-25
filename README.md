@@ -2,6 +2,15 @@
 
 Make sure your aws credentials are setup properly.
 
+## Install
+
+```sh
+# install the CLI
+cargo install dlq
+```
+
+## Commands
+
 ### 1. List your SQS Urls
 
 ```bash
