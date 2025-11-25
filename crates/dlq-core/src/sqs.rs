@@ -32,7 +32,11 @@ impl DeadLetterQueue {
         credentials: Option<aws_sdk_sqs::config::Credentials>,
         endpoint: Option<&str>,
     ) -> Self {
-        let mut loader = aws_config::from_env();
+        let mut loader = aws_config::from_env().region(
+            // supports loading region from known env variables
+            aws_config::meta::region::RegionProviderChain::default_provider()
+                .or_else(aws_config::Region::from_static("us-east-1")),
+        );
 
         if let Some(x) = credentials {
             loader = loader.credentials_provider(x);
