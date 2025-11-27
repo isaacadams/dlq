@@ -1,0 +1,10 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc f86544afb978541263916d0a4bb5ad92fbb8976bbf5530eea9b4057f1ae9019f # shrinks to batch_size = 1, message_template = "aapjzulfot"
+cc 8eb97660bd950c93065bf6bb8324e5223ede4e58a76ab5bc1735994f9208f793 # shrinks to messages = ["\n \n''\t}[}\r\\\"\r}'\\}{\r\t\"\t\"\r{'\r\n\\\n {'\n\t\\\t\"}{{\t\n[\"\r[ '{\n'{[' \n }}{'}\n} '\t\r'\"\r {\t \t'[\n[[\r{\r\r\r \n\"'}[]\\  \t\\{\r\"{{\r}'\"'' \\'["]
+cc 1c8160503c862ef71d47d7cf30e2992624ca393f994d73298ea4b908a25e8e7a # shrinks to messages = ["𘴁v⁆8$ঐ𝕀l{=Bnਸ𐍠.MѨ^g¥'*𑀒&Ⱥ'ￊq\u{2003}$\"𞸂&𐄀ฝ㈑I4?꣑5໕ဍ:𐭙𐩑\u{9be}�𐭸}û.𐵅hA&𒐍:y🛺𔗜𑛐🠀Ѩ%\\nѨ*G?y$𝒥𑧆¥w?ໆ{౨ዓv🕴O𐖼\\*𐠼𑌨djSQ𐌹:3F𑴋1\"࿉ð{{R𐬤ෲ$Ѩங/:!mi{£ⴭແ🫄?\u{1e005}/🕴k\"�๐Q🌜ȺὛ&ী𐤷🯓𐁗🕴Óo𖽼2🕴�sૐஇ:$›k\"Ⱥ\u{11d3a}=⏲ழQøA𐓵𐄀\u{16af4}/?Û𞹡ଳ`¥{/ృᳳ'\"{T=𖵬~ￊ🕴�🕴ዀѨü\\`)*𑍇$e*\u{ac8}蝹🣁𞹇࿋y%𑌭🩠\u{1143e}ਫ਼\"}=ਲ:)𑶥%ᤸ¥ꥭ*Ѩ\u{b55}𞹙2A𑃴mp6SѨL\u{10a38}𝔊fὠ£H4𑛢?�🕴ਬ@𑊄Ί{𞢋*`?)¥𐾁=ౡ𞹟\\𑧝ༀ=¸S4𐴂XѨ?¥\\}W ౠc$*<ை?&)🕴O@{\u{10eac}$.𐵴:&Y\\*X.*Ⱥ'*`{%w\\𑃧¥*🠐<'K%🫘5ಲ𑴉r𖫢?𖬧ᰑ¥Kઓ,\"Ⱥ;&￩𞊚O🩠Ѩb\u{1e01f},?{s𑊙�.I{𒑰%*\u{1e026}y,8*?Ⱥ\u{1cf31}%🥜o\\?Qᛕ&8\u{1e08f}𞟭%𑚏sÙF𐩔🄏�nA&~𑴡%$Ὓ𞋿`𑵢K\u{1136c}~]ῄற\u{1772}*¥]⸰ᥱ/\\𛰮;🧪𑊍Ú/?%🛹%`LȺ=$K🟣﹋"]
+cc 5a92df6555fbd0e98e799cf52962036fead31d84e15511eab5e2d269e4e5b8ab # shrinks to messages = ["aswPdbbEyG   6N 8M9kvPVyb 33XU8ToQ3d0ZZ S2oIN FNd6OzvdNRfG  fy7P 2L US 1VlC8 h4TC55c  n01UyIT85z W9 pTuTU 19RjU5x g1LEwk Nu NwC1M eD65 V9Q4cAwhuO J2 87v 47ehv92b  9OF viLm tq gjY QpJ m SnLU0 zWwz9v dyw4CA H3y1xC M10aR13M2v  Z 11IJEi4wN51 44oJOaXt 4 GO VSP kS pUSNXNe9EQ o3rziwMC9 6Kv qDl8 e46 0 q XCP2i5l j Ifh87sE tRw  3 Z2HM1Jx4HYS9kNk 0CZjgH 91No8wsnnohu"]

@@ -31,6 +31,7 @@ impl DeadLetterQueue {
     pub async fn new(
         credentials: Option<aws_sdk_sqs::config::Credentials>,
         endpoint: Option<&str>,
+        queue_url: Option<&str>,
     ) -> Self {
         let mut loader = aws_config::from_env().region(
             // supports loading region from known env variables
@@ -52,9 +53,9 @@ impl DeadLetterQueue {
         Self {
             config,
             client,
-            default_queue_url: std::env::var("DLQ_URL")
-                .ok()
-                .or(Some(String::from("http://localhost:4566"))),
+            default_queue_url: queue_url
+                .map(|s| s.to_string())
+                .or(std::env::var("DLQ_URL").ok().map(|s| s.into())),
         }
     }
 

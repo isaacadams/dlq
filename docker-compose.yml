@@ -1,18 +1,18 @@
 services:
   localstack:
-    image: localstack/localstack:latest
-    container_name: aws
-    healthcheck:
-      test: awslocal sqs list-queues
-      interval: 30s
-      timeout: 60s
+    container_name: localstack-sqs
+    image: localstack/localstack:latest          # or localstack/localstack:3.8 for stability
     ports:
-      - '127.0.0.1:4566:4566' # LocalStack Gateway
-      - '127.0.0.1:4510-4559:4510-4559' # external services port range
+      - "4566:4566"            # LocalStack edge port (all AWS services)
+      - "4571:4571"            # Web UI (optional)
     environment:
-      - HOSTNAME_EXTERNAL=localstack
-      - SERVICES=sqs:4576,s3
+      - SERVICES=sqs:4576,s3           # only start SQS (faster + cheaper)
+      - DEFAULT_REGION=us-east-1
       - DEBUG=1
     volumes:
-      - '${LOCALSTACK_VOLUME_DIR:-./.localstack}:/var/lib/localstack'
       - '/var/run/docker.sock:/var/run/docker.sock'
+    healthcheck:
+      test: ["CMD", "awslocal", "sqs", "list-queues"]
+      interval: 30s
+      timeout: 60s
+      retries: 10

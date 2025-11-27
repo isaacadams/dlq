@@ -48,7 +48,7 @@ impl Cli {
             self.access_key_id.as_deref(),
             self.secret_access_key.as_deref(),
         );
-        let dlq = DeadLetterQueue::new(credentials, self.endpoint.as_deref()).await;
+        let dlq = DeadLetterQueue::new(credentials, self.endpoint.as_deref(), None).await;
 
         match self.command {
             Commands::Info => {

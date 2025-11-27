@@ -1,0 +1,64 @@
+---
+alwaysApply: true
+---
+
+# Testing Guidelines for DLQ Project
+
+## Test Organization
+
+This project uses `cargo-nextest` as the test runner.
+
+### Unit Tests
+- Located in `#[cfg(test)]` modules within regular source files under `src/`
+- Fast, isolated tests with no external dependencies
+- **Run by default** with `cargo nextest run --lib`
+
+### Integration Tests  
+- Located in `tests/` directory at package root
+- Test public API and cross-module functionality
+- May use external resources (databases, containers, etc.)
+- **Slower and NOT run by default** - must be explicitly called
+- Run separately with `cargo nextest run --test '*'`
+
+## Running Tests
+
+**Default (unit tests only):**
+```bash
+cargo nextest run --lib
+```
+
+**Integration tests only:**
+```bash
+cargo nextest run --test '*'
+```
+
+**All tests (unit + integration):**
+```bash
+cargo nextest run
+```
+
+**Specific package:**
+```bash
+cargo nextest run -p dlq-core --lib     # Unit tests only
+cargo nextest run -p dlq-core           # All tests
+```
+
+## CI Configuration
+
+The CI pipeline (`.github/workflows/ci.yml`) runs all tests together using:
+```bash
+cargo nextest run --workspace --profile ci
+```
+
+## Nextest Configuration
+
+- Configuration is in `.config/nextest.toml`
+- **Do NOT configure retry logic by default**
+- Only add retry configuration when specifically needed for a particular test group
+- Nextest runs tests in parallel by default for better performance
+
+## Installation
+
+```bash
+cargo install cargo-nextest --locked
+```

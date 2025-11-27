@@ -100,4 +100,16 @@ mod tests {
         assert!(received_bodies.contains(&"message2"));
         assert!(received_bodies.contains(&"message3"));
     }
+
+    #[tokio::test]
+    async fn test_send_batch_empty() {
+        let env = TestEnv::new(None).await.unwrap();
+        let queue_name = env.create_sqs_queue("test-empty").await.unwrap();
+        let dlq = env.dlq_for_queue(&queue_name).await;
+
+        let messages: Vec<String> = vec![];
+        let result = dlq.send_batch(&messages).await;
+
+        assert!(result.is_ok(), "send_batch should handle empty batch");
+    }
 }
