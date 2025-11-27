@@ -27,17 +27,89 @@ pub async fn localstack() -> Result<(String, ContainerAsync<LocalStack>), Testco
     Ok((endpoint_url, container))
 }
 
-pub async fn create_test_queue<I: Image>(
+/// A fluent test environment for SQS testing with LocalStack.
+/// Automatically cleans up resources when dropped (even on panic).
+#[allow(dead_code)]
+pub struct TestEnv {
+    endpoint_url: String,
+    container: ContainerAsync<LocalStack>,
+    config: aws_config::SdkConfig,
+    client: aws_sdk_sqs::Client,
+    debug: bool,
+}
+
+#[allow(dead_code)]
+impl TestEnv {
+    /// Create a new test environment with LocalStack
+    pub async fn new(debug: Option<bool>) -> Result<Self, TestcontainersError> {
+        let (endpoint_url, container) = localstack().await?;
+        let config = local_config(&endpoint_url, None).load().await;
+        let client = aws_sdk_sqs::Client::new(&config);
+
+        Ok(Self {
+            endpoint_url,
+            container: container,
+            config,
+            client,
+            debug: debug.unwrap_or(false),
+        })
+    }
+
+    /// Create a queue with a unique name (adds UUID suffix)
+    pub async fn create_sqs_queue(&self, prefix: &str) -> Result<String, TestcontainersError> {
+        create_sqs_queue(&self.container, &prefix, self.debug).await
+    }
+
+    /// Create a DeadLetterQueue instance for a specific queue
+    pub async fn dlq_for_queue(&self, queue_name: &str) -> crate::sqs::DeadLetterQueue {
+        crate::sqs::DeadLetterQueue {
+            config: self.config.clone(),
+            client: self.client.clone(),
+            default_queue_url: Some(self.queue_url(queue_name)),
+        }
+    }
+
+    /// Get the AWS SDK config
+    pub fn config(&self) -> &aws_config::SdkConfig {
+        &self.config
+    }
+
+    /// Get the SQS client
+    pub fn client(&self) -> &aws_sdk_sqs::Client {
+        &self.client
+    }
+
+    /// Get the endpoint URL
+    pub fn endpoint_url(&self) -> &str {
+        &self.endpoint_url
+    }
+
+    /// Get the full queue URL for a queue name
+    pub fn queue_url(&self, queue_name: &str) -> String {
+        let endpoint_url = self.endpoint_url.as_str();
+        format!("{endpoint_url}/000000000000/{queue_name}")
+    }
+}
+
+// Container cleanup is handled automatically by testcontainers' Drop implementation
+// This Drop impl ensures cleanup happens even if the test panics
+// Note: testcontainers will handle the async cleanup in its own Drop handler
+impl Drop for TestEnv {
+    fn drop(&mut self) {}
+}
+
+pub async fn create_sqs_queue<I: Image>(
     container: &ContainerAsync<I>,
     name: &str,
     debug: bool,
-) -> Result<(), TestcontainersError> {
+) -> Result<String, TestcontainersError> {
+    let name = unique_queue_name(name);
     let create_queue_command = testcontainers::core::ExecCommand::new([
         "awslocal",
         "sqs",
         "create-queue",
         "--queue-name",
-        name,
+        &name,
     ])
     .with_container_ready_conditions(vec![testcontainers::core::WaitFor::message_on_stdout(
         "AWS sqs.CreateQueue => 200",
@@ -56,7 +128,7 @@ pub async fn create_test_queue<I: Image>(
         );
     }
 
-    Ok(())
+    Ok(name)
 }
 
 /// Generate a unique queue name for testing, using a UUID suffix.
@@ -67,6 +139,7 @@ pub fn unique_queue_name(prefix: &str) -> String {
 /// Set up a DeadLetterQueue instance with a test queue.
 /// Returns both the DLQ instance and the queue URL.
 /// Retries getting the queue URL to handle eventual consistency.
+#[allow(dead_code)]
 pub async fn setup_dlq_with_queue(
     config: aws_config::SdkConfig,
     queue_name: &str,

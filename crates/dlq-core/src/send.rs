@@ -65,25 +65,13 @@ impl DeadLetterQueue {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::test_utils::{create_test_queue, local_config, localstack, unique_queue_name};
+    use crate::test_utils::TestEnv;
 
     #[tokio::test]
     async fn test_send_batch_success() {
-        let (endpoint_url, container) = localstack().await.unwrap();
-        let queue_name = unique_queue_name("test-batch");
-        create_test_queue(&container, &queue_name, false)
-            .await
-            .unwrap();
-
-        let config = local_config(&endpoint_url, None).load().await;
-        let dlq = DeadLetterQueue {
-            config: local_config(&endpoint_url, None).load().await,
-            client: aws_sdk_sqs::Client::new(&config),
-            default_queue_url: Some(format!(
-                "http://sqs.us-east-1.localhost.localstack.cloud:4566/000000000000/{queue_name}"
-            )),
-        };
+        let env = TestEnv::new(None).await.unwrap();
+        let queue_name = env.create_sqs_queue("test-batch").await.unwrap();
+        let dlq = env.dlq_for_queue(&queue_name).await;
 
         let messages = vec!["message1", "message2", "message3"];
         let result = dlq.send_batch(&messages).await;
@@ -91,12 +79,10 @@ mod tests {
         assert!(result.is_ok(), "send_batch should succeed");
 
         // Verify messages were actually sent by receiving them
-        let client = aws_sdk_sqs::Client::new(&config);
-        let receive_output = client
+        let receive_output = env
+            .client()
             .receive_message()
-            .queue_url(format!(
-                "http://sqs.us-east-1.localhost.localstack.cloud:4566/000000000000/{queue_name}"
-            ))
+            .queue_url(env.queue_url(&queue_name))
             .max_number_of_messages(10)
             .send()
             .await
@@ -113,7 +99,5 @@ mod tests {
         assert!(received_bodies.contains(&"message1"));
         assert!(received_bodies.contains(&"message2"));
         assert!(received_bodies.contains(&"message3"));
-
-        container.stop().await.unwrap();
     }
 }
