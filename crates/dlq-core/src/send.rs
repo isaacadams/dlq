@@ -6,8 +6,10 @@ pub enum SendError {
     MissingQueueUrl,
     BuildEntryFailed(String),
     AwsSdkError(
-        aws_sdk_sqs::error::SdkError<
-            aws_sdk_sqs::operation::send_message_batch::SendMessageBatchError,
+        Box<
+            aws_sdk_sqs::error::SdkError<
+                aws_sdk_sqs::operation::send_message_batch::SendMessageBatchError,
+            >,
         >,
     ),
 }
@@ -57,7 +59,7 @@ impl DeadLetterQueue {
             .set_entries(Some(entries))
             .send()
             .await
-            .map_err(SendError::AwsSdkError)?;
+            .map_err(|e| SendError::AwsSdkError(Box::new(e)))?;
 
         Ok(())
     }

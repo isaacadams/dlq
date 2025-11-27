@@ -55,7 +55,7 @@ impl DeadLetterQueue {
             client,
             default_queue_url: queue_url
                 .map(|s| s.to_string())
-                .or(std::env::var("DLQ_URL").ok().map(|s| s.into())),
+                .or(std::env::var("DLQ_URL").ok()),
         }
     }
 
