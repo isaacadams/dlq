@@ -1,0 +1,93 @@
+# Nextest configuration for dlq project
+# Documentation: https://nexte.st/book/configuration.html
+
+[profile.default]
+# Number of retries for failed tests (0 = no retries)
+retries = 0
+
+# Timeout for slow tests
+slow-timeout = { period = "60s", terminate-after = 2 }
+
+# Test threads (0 = use all available cores)
+test-threads = "num-cpus"
+
+# Status level for tests
+status-level = "pass"
+
+# Failure output
+failure-output = "immediate"
+
+# Success output (normally hidden, set to "immediate" to always show)
+success-output = "never"
+
+[profile.ci]
+# CI profile - no retries by default
+retries = 0
+
+# Longer timeout in CI
+slow-timeout = { period = "120s", terminate-after = 3 }
+
+# More verbose output in CI
+failure-output = "immediate-final"
+success-output = "never"
+
+# Fail fast in CI to save resources
+fail-fast = false
+
+[profile.ci-quick]
+# Quick CI profile for fast feedback (unit tests only)
+retries = 0
+fail-fast = true
+
+[profile.ci-flaky]
+# CI profile with retries for flaky tests
+retries = { backoff = "exponential", count = 3, delay = "1s" }
+
+# Integration tests require containers and should be limited
+[[profile.default.overrides]]
+filter = 'test(integration_) | test(cli_) | test(test_send_batch) | test(test_poll) | test(list_queues)'
+threads-required = 1
+# These tests use LocalStack containers which need sequential execution to avoid port conflicts
+
+# Property-based tests are CPU intensive
+[[profile.default.overrides]]
+filter = 'test(prop_)'
+threads-required = 1
+slow-timeout = { period = "300s", terminate-after = 2 }
+
+# Quick unit tests that don't use external resources
+[[profile.default.overrides]]
+filter = 'test(test_) & !test(test_send_batch)'
+threads-required = 'num-cpus'
+
+[test-groups.unit]
+# Fast unit tests - maximize parallelism
+max-threads = 16
+
+[test-groups.integration]  
+# Slower integration tests - limit concurrency
+max-threads = 4
+
+[test-groups.prop-tests]
+# Property tests - very slow, limit to 1-2 at a time
+max-threads = 2
+
+# Script overrides - custom per-test settings
+[[profile.default.overrides]]
+filter = 'test(localstack)'
+# Tests that spin up LocalStack need more time
+slow-timeout = { period = "90s" }
+leak-timeout = "10s"
+
+# Filter to run only fast tests
+[profile.fast]
+default-filter = '!test(integration_) & !test(prop_) & !test(cli_)'
+
+# Filter to run only integration tests
+[profile.integration]
+default-filter = 'test(integration_) | test(cli_)'
+
+# Filter to run property tests
+[profile.prop-tests]
+default-filter = 'test(prop_)'
+
