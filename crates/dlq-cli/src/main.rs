@@ -1,6 +1,7 @@
 use clap::{Parser, Subcommand};
 use dlq::DeadLetterQueue;
 
+mod reader;
 mod send;
 #[cfg(test)]
 mod test;

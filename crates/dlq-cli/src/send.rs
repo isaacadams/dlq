@@ -1,5 +1,6 @@
 pub async fn run() {
-    let (h_stdin, rx_stdin) = stdin(100);
+    let (h_stdin, rx_stdin) = crate::reader::concurrent_lines(tokio::io::stdin(), 100);
+
     SqsBatch::local(
         "http://sqs.us-east-1.localhost.localstack.cloud:4566/000000000000/demo",
         Some("http://localhost:4566"),
@@ -11,32 +12,6 @@ pub async fn run() {
     if let Err(e) = h_stdin.await {
         eprintln!("error from stdin: {e}");
     }
-}
-
-pub fn stdin(
-    buffer_size: usize,
-) -> (
-    tokio::task::JoinHandle<()>,
-    tokio::sync::mpsc::Receiver<String>,
-) {
-    use tokio::io::{self, AsyncBufReadExt, BufReader};
-    let stdin = io::stdin();
-    let reader = BufReader::new(stdin);
-    let (tx, rx) = tokio::sync::mpsc::channel::<String>(buffer_size);
-
-    let task = tokio::spawn(async move {
-        let mut lines = reader.lines();
-        while let Ok(Some(line)) = lines.next_line().await {
-            match tx.send(line).await {
-                Ok(_) => (),
-                Err(e) => {
-                    eprintln!("error sending message to channel: {}", e);
-                    break;
-                }
-            }
-        }
-    });
-    (task, rx)
 }
 
 pub struct SqsBatch {
@@ -185,5 +160,63 @@ mod validation {
         fn as_ref(&self) -> &str {
             &self.0
         }
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use crate::reader::concurrent_lines;
+    use crate::test::{create_test_queue, localstack};
+
+    use super::*;
+
+    #[tokio::test]
+    async fn test_local() {
+        // create a localstack container and a queue
+        let (endpoint, container) = localstack().await.unwrap();
+        let queue_url = create_test_queue(&container, "batch-send-test", false)
+            .await
+            .unwrap();
+
+        // create a reader for the batch messages
+        let reader = tokio::io::BufReader::new(std::io::Cursor::new(
+            b"first line\nsecond line\nthird\n".to_vec(),
+        ));
+        let (handle, rx) = concurrent_lines(reader, 10);
+
+        // create a sqs batch client and send the batch messages to the queue
+        let sqs = SqsBatch::local(&queue_url, Some(endpoint)).await;
+        sqs.send(rx).await;
+
+        // wait for the handle to complete to ensure the messages are sent
+        handle.await.unwrap();
+
+        // create a sqs client and receive the messages from the queue
+        let client = aws_sdk_sqs::Client::new(&sqs.aws_config);
+        let receive_output = client
+            .receive_message()
+            .queue_url(&queue_url)
+            .max_number_of_messages(10)
+            .send()
+            .await
+            .unwrap();
+
+        // verify the messages were received without respect to the order
+        let messages = receive_output.messages.unwrap_or_default();
+        assert_eq!(messages.len(), 3);
+
+        let received_bodies = messages
+            .iter()
+            .filter_map(|m| m.body())
+            .collect::<Vec<&str>>();
+
+        assert_eq!(received_bodies.len(), 3);
+        assert!(received_bodies.contains(&"first line"));
+        assert!(received_bodies.contains(&"second line"));
+        assert!(received_bodies.contains(&"third"));
+
+        container.stop().await.unwrap();
+
+        ()
     }
 }

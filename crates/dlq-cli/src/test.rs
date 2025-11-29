@@ -9,7 +9,7 @@ use testcontainers_modules::{
 };
 use tokio::io::AsyncReadExt;
 
-async fn localstack() -> Result<(String, ContainerAsync<LocalStack>), TestcontainersError> {
+pub async fn localstack() -> Result<(String, ContainerAsync<LocalStack>), TestcontainersError> {
     let request = LocalStack::default()
         .with_tag("latest")
         .with_env_var("SERVICES", "sqs:4576,s3")
@@ -23,11 +23,11 @@ async fn localstack() -> Result<(String, ContainerAsync<LocalStack>), Testcontai
     Ok((endpoint_url, container))
 }
 
-async fn create_test_queue<I: Image>(
+pub async fn create_test_queue<I: Image>(
     container: &ContainerAsync<I>,
     name: &str,
     debug: bool,
-) -> Result<(), TestcontainersError> {
+) -> Result<String, TestcontainersError> {
     let create_queue_command = testcontainers::core::ExecCommand::new([
         "awslocal",
         "sqs",
@@ -39,20 +39,30 @@ async fn create_test_queue<I: Image>(
         "AWS sqs.CreateQueue => 200",
     )]);
 
-    let mut output = container.exec(create_queue_command).await?;
+    let mut result = container.exec(create_queue_command).await?;
 
     if debug {
         let mut stdout = String::new();
         let mut stderr = String::new();
-        output.stdout().read_to_string(&mut stdout).await.unwrap();
-        output.stderr().read_to_string(&mut stderr).await.unwrap();
+        result.stdout().read_to_string(&mut stdout).await.unwrap();
+        result.stderr().read_to_string(&mut stderr).await.unwrap();
         println!(
             "Queue creation command output:\nstdout: {}\nstderr: {}",
             stdout, stderr
         );
     }
 
-    Ok(())
+    let output = result.stdout_to_vec().await?;
+
+    let json: serde_json::Value =
+        serde_json::from_slice(&output).map_err(|e| TestcontainersError::Other(Box::new(e)))?;
+
+    match json["QueueUrl"].as_str() {
+        Some(url) => Ok(url.to_string()),
+        None => Err(TestcontainersError::Other(
+            "QueueUrl not found in response".into(),
+        )),
+    }
 }
 
 #[tokio::test]
@@ -94,11 +104,10 @@ async fn list_queues() {
 async fn poll_queue() {
     let (endpoint, container) = localstack().await.unwrap();
 
-    create_test_queue(&container, "test-queue", false)
+    let queue_url = create_test_queue(&container, "test-queue", false)
         .await
         .unwrap();
-    let queue_url =
-        format!("http://sqs.us-east-1.localhost.localstack.cloud:4566/000000000000/test-queue");
+
     send_messages_to_queue(&queue_url, 11, &endpoint)
         .await
         .unwrap();
@@ -130,7 +139,7 @@ async fn poll_queue() {
     ()
 }
 
-fn local_config(endpoint_url: &str, region: Option<&'static str>) -> aws_config::ConfigLoader {
+pub fn local_config(endpoint_url: &str, region: Option<&'static str>) -> aws_config::ConfigLoader {
     aws_config::defaults(aws_config::BehaviorVersion::latest())
         .endpoint_url(endpoint_url)
         .region(region.unwrap_or("us-east-1"))
