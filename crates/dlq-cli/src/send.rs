@@ -7,7 +7,10 @@ pub async fn run() {
     .await
     .send(rx_stdin)
     .await;
-    h_stdin.await.unwrap();
+
+    if let Err(e) = h_stdin.await {
+        eprintln!("error from stdin: {e}");
+    }
 }
 
 pub fn stdin(
@@ -42,20 +45,28 @@ pub struct SqsBatch {
 }
 
 impl SqsBatch {
-    pub async fn local(aws_sqs_queue_url: &str, aws_endpoint: Option<&str>) -> Self {
+    pub async fn local(aws_sqs_queue_url: &str, aws_endpoint: Option<impl Into<String>>) -> Self {
+        let endpoint = aws_endpoint
+            .map(|s| s.into())
+            .or(std::env::var("AWS_ENDPOINT").ok())
+            .or(Some("http://localhost:4566".into()));
+
+        let mut loader = aws_config::from_env()
+            .region(
+                // supports loading region from known env variables
+                aws_config::meta::region::RegionProviderChain::default_provider()
+                    .or_else(aws_config::Region::from_static("us-east-1")),
+            )
+            .credentials_provider(aws_sdk_sqs::config::Credentials::new(
+                "test", "test", None, None, "static",
+            ));
+
+        if let Some(endpoint) = endpoint {
+            loader = loader.endpoint_url(endpoint);
+        }
+
         Self {
-            aws_config: aws_config::from_env()
-                .region(
-                    // supports loading region from known env variables
-                    aws_config::meta::region::RegionProviderChain::default_provider()
-                        .or_else(aws_config::Region::from_static("us-east-1")),
-                )
-                .credentials_provider(aws_sdk_sqs::config::Credentials::new(
-                    "test", "test", None, None, "static",
-                ))
-                .endpoint_url(aws_endpoint.unwrap_or("http://localhost:4566"))
-                .load()
-                .await,
+            aws_config: loader.load().await,
             aws_sqs_queue_url: aws_sqs_queue_url.to_string(),
         }
     }
@@ -74,8 +85,11 @@ impl SqsBatch {
 
                     println!("{}", x);
 
+                    // BatchId is a wrapper around a string that validates the ID is a valid SQS batch ID
+                    // BatchId::new(uuid::Uuid::new_v4().to_string()).unwrap().0
+                    let id = uuid::Uuid::new_v4().hyphenated().to_string();
                     let entry = aws_sdk_sqs::types::SendMessageBatchRequestEntry::builder()
-                        .id(BatchId::new(uuid::Uuid::new_v4().to_string()).unwrap().0)
+                        .id(id)
                         .message_body(x)
                         .build()
                         .unwrap();
@@ -94,12 +108,17 @@ impl SqsBatch {
                         job(&client, aws_sqs_queue_url.as_ref(), entries).await;
                     }
                 },
-                Concurrency::concurrent_ordered(10),
+                // SQS batch sends are inherently unordered in results (failed items can come back in any order)
+                // using unordered concurrency gives better throughput
+                Concurrency::concurrent_unordered(10),
             )
             .build();
 
         while rx_pipeline.recv().await.is_some() {}
-        h_pipeline.await.unwrap();
+
+        if let Err(e) = h_pipeline.await {
+            eprintln!("error from pipeline: {e}");
+        }
     }
 }
 
@@ -131,37 +150,40 @@ async fn job(
     }
 }
 
-use std::convert::Into;
+#[allow(dead_code)]
+mod validation {
+    use std::convert::Into;
 
-#[derive(Debug, Clone)]
-pub struct BatchId(String);
+    #[derive(Debug, Clone)]
+    pub struct BatchId(String);
 
-impl BatchId {
-    pub fn new<S: Into<String>>(id: S) -> Result<Self, String> {
-        let id_str = id.into();
-        if id_str.is_empty() {
-            return Err("Batch ID cannot be empty".to_string());
-        }
-        if id_str.len() > 80 {
-            return Err(format!(
-                "Batch ID exceeds maximum length: {} > 80 characters",
-                id_str.len()
-            ));
-        }
-        for c in id_str.chars() {
-            if !c.is_alphanumeric() && c != '-' && c != '_' {
+    impl BatchId {
+        pub fn new<S: Into<String>>(id: S) -> Result<Self, String> {
+            let id_str = id.into();
+            if id_str.is_empty() {
+                return Err("Batch ID cannot be empty".to_string());
+            }
+            if id_str.len() > 80 {
                 return Err(format!(
-                    "Invalid character in Batch ID: '{}'. Allowed: alphanumeric, '-', '_'",
-                    c
+                    "Batch ID exceeds maximum length: {} > 80 characters",
+                    id_str.len()
                 ));
             }
+            for c in id_str.chars() {
+                if !c.is_alphanumeric() && c != '-' && c != '_' {
+                    return Err(format!(
+                        "Invalid character in Batch ID: '{}'. Allowed: alphanumeric, '-', '_'",
+                        c
+                    ));
+                }
+            }
+            Ok(Self(id_str))
         }
-        Ok(Self(id_str))
     }
-}
 
-impl AsRef<str> for BatchId {
-    fn as_ref(&self) -> &str {
-        &self.0
+    impl AsRef<str> for BatchId {
+        fn as_ref(&self) -> &str {
+            &self.0
+        }
     }
 }
