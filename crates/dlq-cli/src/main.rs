@@ -1,6 +1,7 @@
 use clap::{Parser, Subcommand};
 use dlq::DeadLetterQueue;
 
+mod send;
 #[cfg(test)]
 mod test;
 
@@ -40,6 +41,7 @@ enum Commands {
         /// ( can optionally be set via environment variable DLQ_URL=... )
         url: Option<String>,
     },
+    Send,
 }
 
 impl Cli {
@@ -64,6 +66,7 @@ impl Cli {
             Commands::Poll { url } => {
                 dlq.poll(url.as_deref()).await;
             }
+            Commands::Send => send::run().await,
         };
 
         Ok(())
