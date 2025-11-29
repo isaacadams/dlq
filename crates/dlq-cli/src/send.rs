@@ -68,14 +68,14 @@ impl SqsBatch {
         let (mut rx_pipeline, h_pipeline) = Pipeline::from(rx)
             .filter_map(
                 |x| async move {
-                    if x.len() < 1 {
+                    if x.is_empty() {
                         return None;
                     }
 
                     println!("{}", x);
 
                     let entry = aws_sdk_sqs::types::SendMessageBatchRequestEntry::builder()
-                        .id(BatchId::new(uuid::Uuid::new_v4()).unwrap().0)
+                        .id(BatchId::new(uuid::Uuid::new_v4().to_string()).unwrap().0)
                         .message_body(x)
                         .build()
                         .unwrap();
@@ -91,14 +91,14 @@ impl SqsBatch {
                     let client = client.clone();
                     let aws_sqs_queue_url = aws_sqs_queue_url.clone();
                     async move {
-                        job(&*client, aws_sqs_queue_url.as_ref(), entries).await;
+                        job(&client, aws_sqs_queue_url.as_ref(), entries).await;
                     }
                 },
                 Concurrency::concurrent_ordered(10),
             )
             .build();
 
-        while let Some(_) = rx_pipeline.recv().await {}
+        while rx_pipeline.recv().await.is_some() {}
         h_pipeline.await.unwrap();
     }
 }
