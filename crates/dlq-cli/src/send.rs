@@ -1,3 +1,15 @@
+pub async fn run() {
+    let (h_stdin, rx_stdin) = stdin(100);
+    SqsBatch::local(
+        "http://sqs.us-east-1.localhost.localstack.cloud:4566/000000000000/demo",
+        Some("http://localhost:4566"),
+    )
+    .await
+    .send(rx_stdin)
+    .await;
+    h_stdin.await.unwrap();
+}
+
 pub fn stdin(
     buffer_size: usize,
 ) -> (
@@ -24,59 +36,71 @@ pub fn stdin(
     (task, rx)
 }
 
-pub async fn run() {
-    let (h_stdin, rx_stdin) = stdin(100);
-    sqs_batch_send(
-        "http://localhost:4566",
-        // aws --endpoint-url http://localhost:4566 sqs create-queue --queue-name demo --output json
-        "http://sqs.us-east-1.localhost.localstack.cloud:4566/000000000000/demo",
-        rx_stdin,
-    )
-    .await;
-    h_stdin.await.unwrap();
+pub struct SqsBatch {
+    pub aws_config: aws_config::SdkConfig,
+    pub aws_sqs_queue_url: String,
 }
 
-pub async fn sqs_batch_send(
-    aws_endpoint: &str,
-    aws_sqs_queue_url: &'static str,
-    rx: tokio::sync::mpsc::Receiver<String>,
-) {
-    let client = std::sync::Arc::new(sqs(aws_endpoint).await);
-    use pumps::{Concurrency, Pipeline};
-    let (mut rx_pipeline, h_pipeline) = Pipeline::from(rx)
-        .filter_map(
-            |x| async move {
-                if x.len() < 1 {
-                    return None;
-                }
+impl SqsBatch {
+    pub async fn local(aws_sqs_queue_url: &str, aws_endpoint: Option<&str>) -> Self {
+        Self {
+            aws_config: aws_config::from_env()
+                .region(
+                    // supports loading region from known env variables
+                    aws_config::meta::region::RegionProviderChain::default_provider()
+                        .or_else(aws_config::Region::from_static("us-east-1")),
+                )
+                .credentials_provider(aws_sdk_sqs::config::Credentials::new(
+                    "test", "test", None, None, "static",
+                ))
+                .endpoint_url(aws_endpoint.unwrap_or("http://localhost:4566"))
+                .load()
+                .await,
+            aws_sqs_queue_url: aws_sqs_queue_url.to_string(),
+        }
+    }
 
-                println!("{}", x);
+    pub async fn send(&self, rx: tokio::sync::mpsc::Receiver<String>) {
+        let client = std::sync::Arc::new(aws_sdk_sqs::Client::new(&self.aws_config));
+        let aws_sqs_queue_url = std::sync::Arc::new(self.aws_sqs_queue_url.clone());
 
-                let entry = aws_sdk_sqs::types::SendMessageBatchRequestEntry::builder()
-                    .id(BatchId::new(uuid::Uuid::new_v4()).unwrap().0)
-                    .message_body(x)
-                    .build()
-                    .unwrap();
+        use pumps::{Concurrency, Pipeline};
+        let (mut rx_pipeline, h_pipeline) = Pipeline::from(rx)
+            .filter_map(
+                |x| async move {
+                    if x.len() < 1 {
+                        return None;
+                    }
 
-                println!("entry: {:#?}", entry);
-                Some(entry)
-            },
-            Concurrency::serial(),
-        )
-        .batch(10)
-        .map(
-            move |entries| {
-                let client = client.clone();
-                async move {
-                    job(&*client, aws_sqs_queue_url, entries).await;
-                }
-            },
-            Concurrency::concurrent_ordered(10),
-        )
-        .build();
+                    println!("{}", x);
 
-    while let Some(_) = rx_pipeline.recv().await {}
-    h_pipeline.await.unwrap();
+                    let entry = aws_sdk_sqs::types::SendMessageBatchRequestEntry::builder()
+                        .id(BatchId::new(uuid::Uuid::new_v4()).unwrap().0)
+                        .message_body(x)
+                        .build()
+                        .unwrap();
+
+                    println!("entry: {:#?}", entry);
+                    Some(entry)
+                },
+                Concurrency::serial(),
+            )
+            .batch(10)
+            .map(
+                move |entries| {
+                    let client = client.clone();
+                    let aws_sqs_queue_url = aws_sqs_queue_url.clone();
+                    async move {
+                        job(&*client, aws_sqs_queue_url.as_ref(), entries).await;
+                    }
+                },
+                Concurrency::concurrent_ordered(10),
+            )
+            .build();
+
+        while let Some(_) = rx_pipeline.recv().await {}
+        h_pipeline.await.unwrap();
+    }
 }
 
 async fn job(
@@ -105,23 +129,6 @@ async fn job(
             }
         }
     }
-}
-
-async fn sqs(endpoint: &str) -> aws_sdk_sqs::Client {
-    aws_sdk_sqs::Client::new(
-        &aws_config::from_env()
-            .region(
-                // supports loading region from known env variables
-                aws_config::meta::region::RegionProviderChain::default_provider()
-                    .or_else(aws_config::Region::from_static("us-east-1")),
-            )
-            .credentials_provider(aws_sdk_sqs::config::Credentials::new(
-                "test", "test", None, None, "static",
-            ))
-            .endpoint_url(endpoint)
-            .load()
-            .await,
-    )
 }
 
 use std::convert::Into;
