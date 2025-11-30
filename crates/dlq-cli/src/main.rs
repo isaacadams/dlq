@@ -1,6 +1,8 @@
 use clap::{Parser, Subcommand};
 use dlq::DeadLetterQueue;
 
+#[allow(dead_code)]
+mod database;
 mod reader;
 mod send;
 #[cfg(test)]
@@ -43,6 +45,10 @@ enum Commands {
         url: Option<String>,
     },
     Send,
+    Database {
+        #[command(subcommand)]
+        command: database::DatabaseCommands,
+    },
 }
 
 impl Cli {
@@ -68,6 +74,9 @@ impl Cli {
                 dlq.poll(url.as_deref()).await;
             }
             Commands::Send => send::run().await,
+            Commands::Database { command } => {
+                command.run().await?;
+            }
         };
 
         Ok(())
