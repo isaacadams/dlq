@@ -83,7 +83,7 @@ impl Cli {
             }
             Commands::Job { command } => {
                 command.run().await?;
-            },
+            }
         };
 
         Ok(())

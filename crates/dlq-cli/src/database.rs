@@ -225,6 +225,7 @@ pub async fn claim_pending_items(
         .map(|_| "?".to_string())
         .collect::<Vec<_>>()
         .join(",");
+
     let update_query = format!(
         "UPDATE job_items SET status = 'processing', updated_at = CURRENT_TIMESTAMP WHERE id IN ({placeholders})"
     );
