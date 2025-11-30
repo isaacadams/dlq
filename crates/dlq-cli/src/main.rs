@@ -45,6 +45,10 @@ enum Commands {
         url: Option<String>,
     },
     Send,
+    Job {
+        #[command(subcommand)]
+        command: database::JobCommands,
+    },
     Database {
         #[command(subcommand)]
         command: database::DatabaseCommands,
@@ -77,6 +81,9 @@ impl Cli {
             Commands::Database { command } => {
                 command.run().await?;
             }
+            Commands::Job { command } => {
+                command.run().await?;
+            },
         };
 
         Ok(())

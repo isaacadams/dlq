@@ -11,6 +11,28 @@ use sqlx::{
 use tokio::sync::OnceCell;
 
 #[derive(Debug, clap::Subcommand)]
+pub enum JobCommands {
+    Status { id: i64 },
+}
+
+impl JobCommands {
+    pub async fn run(self) -> anyhow::Result<()> {
+        match self {
+            JobCommands::Status { id } => {
+                let count = check_and_close_job(id).await.unwrap();
+                if let Some(count) = count {
+                    println!("{} job items are incomplete.", count);
+                } else {
+                    println!("job complete.");
+                }
+            }
+        }
+
+        Ok(())
+    }
+}
+
+#[derive(Debug, clap::Subcommand)]
 pub enum DatabaseCommands {
     Seed {
         #[arg(long)]
@@ -254,7 +276,8 @@ pub async fn complete_item(
 }
 
 /// Checks if a job is complete (all items 'done' or 'failed') and updates timestamp_end if so.
-pub async fn check_and_close_job(job_id: i64) -> Result<bool, sqlx::Error> {
+/// returns none if the job is done, otherwise returns count of all items still pending or processing
+pub async fn check_and_close_job(job_id: i64) -> Result<Option<i64>, sqlx::Error> {
     let pool = pool().await;
     let row = sqlx::query(
         r#"
@@ -268,21 +291,23 @@ pub async fn check_and_close_job(job_id: i64) -> Result<bool, sqlx::Error> {
     .await?;
 
     let pending_count: i64 = row.get("pending_count");
-    if pending_count == 0 {
-        sqlx::query(
-            r#"
-            UPDATE jobs
-            SET timestamp_end = CURRENT_TIMESTAMP
-            WHERE id = $1 AND timestamp_end IS NULL
-            "#,
-        )
-        .bind(job_id)
-        .execute(pool)
-        .await?;
-        Ok(true)
-    } else {
-        Ok(false)
+
+    if pending_count > 0 {
+        return Ok(Some(pending_count));
     }
+
+    sqlx::query(
+        r#"
+        UPDATE jobs
+        SET timestamp_end = CURRENT_TIMESTAMP
+        WHERE id = $1 AND timestamp_end IS NULL
+        "#,
+    )
+    .bind(job_id)
+    .execute(pool)
+    .await?;
+
+    Ok(None)
 }
 
 /// Preloads the DB with a new job containing `num_items` pending items.
