@@ -45,6 +45,30 @@ enum Commands {
         url: Option<String>,
     },
     Send,
+    /// Send job items to an SQS queue in batches
+    SendBatch {
+        /// Job ID to process (must have name = 'send_batch')
+        job_id: i64,
+
+        /// SQS queue URL
+        queue_url: String,
+
+        /// Items per SQS batch (default: 10, max: 10)
+        #[arg(long, default_value = "10")]
+        batch_size: usize,
+
+        /// Items to stage from SQLite per round (auto-optimizes if omitted)
+        #[arg(long)]
+        stage_size: Option<i64>,
+
+        /// Parallel SQS batch sends (default: 5)
+        #[arg(long, default_value = "5")]
+        concurrency: usize,
+
+        /// Max retries per item (default: 0 = disabled)
+        #[arg(long, default_value = "0")]
+        retry_limit: u32,
+    },
     Job {
         #[command(subcommand)]
         command: database::JobCommands,
@@ -72,12 +96,52 @@ impl Cli {
             }
             Commands::List => {
                 let queues = dlq.list().await;
-                println!("{}", queues.join(","));
+                if queues.is_empty() {
+                    println!("No queues found.\n");
+                    println!("To create a new queue, use the AWS CLI:");
+                    println!("  aws sqs create-queue --queue-name <your-queue-name>\n");
+                    println!("Or with LocalStack:");
+                    println!("  aws --endpoint-url=http://localhost:4566 sqs create-queue --queue-name <your-queue-name>");
+                } else {
+                    println!("┌─────────────────────────────────────────────────────────────────┐");
+                    println!("│ Available SQS Queues                                            │");
+                    println!("├─────────────────────────────────────────────────────────────────┤");
+                    for (i, url) in queues.iter().enumerate() {
+                        // Extract queue name from URL
+                        let name = url.rsplit('/').next().unwrap_or(url);
+                        println!("│ {}. {}", i + 1, name);
+                        println!("│    {}", url);
+                        if i < queues.len() - 1 {
+                            println!("│");
+                        }
+                    }
+                    println!("└─────────────────────────────────────────────────────────────────┘");
+                    println!("\nTotal: {} queue(s)", queues.len());
+                }
             }
             Commands::Poll { url } => {
                 dlq.poll(url.as_deref()).await;
             }
             Commands::Send => send::run().await,
+            Commands::SendBatch {
+                job_id,
+                queue_url,
+                batch_size,
+                stage_size,
+                concurrency,
+                retry_limit,
+            } => {
+                send::run_batch(
+                    job_id,
+                    &queue_url,
+                    self.endpoint.as_deref(),
+                    batch_size.min(10), // SQS max is 10
+                    stage_size,
+                    concurrency,
+                    retry_limit,
+                )
+                .await?;
+            }
             Commands::Database { command } => {
                 command.run().await?;
             }
