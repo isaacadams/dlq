@@ -150,7 +150,7 @@ pub async fn run_batch(
     }
 
     // Auto-optimize stage size if not provided
-    let stage_size = stage_size.unwrap_or_else(|| {
+    let stage_size = stage_size.unwrap_or({
         if total_pending < 1000 {
             total_pending
         } else {
