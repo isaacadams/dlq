@@ -812,6 +812,149 @@ mod test {
 
     use super::*;
 
+    // -------------------------------------------------------------------------
+    // transform_input Unit Tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_transform_input_text_mode_with_string() {
+        let input = serde_json::json!("hello world");
+        let (id, body) = transform_input(&input, "text");
+
+        // ID should be a valid UUID
+        assert!(uuid::Uuid::parse_str(&id).is_ok());
+        // Body should be the raw string
+        assert_eq!(body, "hello world");
+    }
+
+    #[test]
+    fn test_transform_input_text_mode_with_object() {
+        let input = serde_json::json!({"key": "value"});
+        let (id, body) = transform_input(&input, "text");
+
+        // ID should be a valid UUID
+        assert!(uuid::Uuid::parse_str(&id).is_ok());
+        // Body should be JSON serialized
+        assert_eq!(body, r#"{"key":"value"}"#);
+    }
+
+    #[test]
+    fn test_transform_input_json_mode_with_id_and_body() {
+        let input = serde_json::json!({
+            "id": "my-custom-id-123",
+            "body": {"data": "payload"}
+        });
+        let (id, body) = transform_input(&input, "json");
+
+        // ID should use the provided id field
+        assert_eq!(id, "my-custom-id-123");
+        // Body should be the serialized body field
+        assert_eq!(body, r#"{"data":"payload"}"#);
+    }
+
+    #[test]
+    fn test_transform_input_json_mode_with_string_body() {
+        let input = serde_json::json!({
+            "id": "msg-456",
+            "body": "plain text body"
+        });
+        let (id, body) = transform_input(&input, "json");
+
+        assert_eq!(id, "msg-456");
+        // String body should be used as-is (not double-quoted)
+        assert_eq!(body, "plain text body");
+    }
+
+    #[test]
+    fn test_transform_input_json_mode_missing_id() {
+        let input = serde_json::json!({
+            "body": {"data": "test"}
+        });
+        let (id, body) = transform_input(&input, "json");
+
+        // Should generate a UUID when id is missing
+        assert!(uuid::Uuid::parse_str(&id).is_ok());
+        assert_eq!(body, r#"{"data":"test"}"#);
+    }
+
+    #[test]
+    fn test_transform_input_json_mode_missing_body() {
+        let input = serde_json::json!({
+            "id": "id-only"
+        });
+        let (id, body) = transform_input(&input, "json");
+
+        assert_eq!(id, "id-only");
+        // When body is missing, serialize the entire input
+        assert!(body.contains("id-only"));
+    }
+
+    #[test]
+    fn test_transform_input_json_mode_not_object() {
+        // When input is not an object in JSON mode, fall back to text behavior
+        let input = serde_json::json!("just a string");
+        let (id, body) = transform_input(&input, "json");
+
+        assert!(uuid::Uuid::parse_str(&id).is_ok());
+        assert_eq!(body, r#""just a string""#);
+    }
+
+    #[test]
+    fn test_transform_input_default_mode_is_text() {
+        let input = serde_json::json!("test message");
+        let (id1, body1) = transform_input(&input, "text");
+        let (id2, body2) = transform_input(&input, "unknown_mode");
+
+        // Both should behave the same (text mode)
+        assert!(uuid::Uuid::parse_str(&id1).is_ok());
+        assert!(uuid::Uuid::parse_str(&id2).is_ok());
+        assert_eq!(body1, "test message");
+        assert_eq!(body2, "test message");
+    }
+
+    // -------------------------------------------------------------------------
+    // BatchId Validation Unit Tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_batch_id_valid() {
+        assert!(super::validation::BatchId::new("valid-id_123").is_ok());
+        assert!(super::validation::BatchId::new("a").is_ok());
+        assert!(super::validation::BatchId::new("ABC-xyz_789").is_ok());
+    }
+
+    #[test]
+    fn test_batch_id_empty() {
+        let result = super::validation::BatchId::new("");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("empty"));
+    }
+
+    #[test]
+    fn test_batch_id_too_long() {
+        let long_id = "a".repeat(81);
+        let result = super::validation::BatchId::new(long_id);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("maximum length"));
+    }
+
+    #[test]
+    fn test_batch_id_invalid_characters() {
+        let result = super::validation::BatchId::new("invalid@id");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Invalid character"));
+
+        let result = super::validation::BatchId::new("has space");
+        assert!(result.is_err());
+
+        let result = super::validation::BatchId::new("has.dot");
+        assert!(result.is_err());
+    }
+
+    // -------------------------------------------------------------------------
+    // SqsBatch Integration Tests (require LocalStack)
+    // -------------------------------------------------------------------------
+
     #[tokio::test]
     async fn test_local() {
         // create a localstack container and a queue
@@ -858,7 +1001,133 @@ mod test {
         assert!(received_bodies.contains(&"third"));
 
         container.stop().await.unwrap();
+    }
 
-        ()
+    #[tokio::test]
+    async fn test_verify_queue_exists_valid_queue() {
+        let (endpoint, container) = localstack().await.unwrap();
+        let queue_url = create_test_queue(&container, "exists-test", false)
+            .await
+            .unwrap();
+
+        let sqs = SqsBatch::local(&queue_url, Some(endpoint)).await;
+        let client = aws_sdk_sqs::Client::new(&sqs.aws_config);
+
+        // Should succeed for an existing queue
+        let result = verify_queue_exists(&client, &queue_url).await;
+        assert!(result.is_ok());
+
+        container.stop().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_verify_queue_exists_invalid_queue() {
+        let (endpoint, container) = localstack().await.unwrap();
+
+        // Create a valid queue first (so we have available queues to list)
+        let _queue_url = create_test_queue(&container, "valid-queue", false)
+            .await
+            .unwrap();
+
+        let sqs = SqsBatch::local("http://fake-queue-url/nonexistent", Some(endpoint)).await;
+        let client = aws_sdk_sqs::Client::new(&sqs.aws_config);
+
+        // Should fail with helpful error message
+        let result =
+            verify_queue_exists(&client, "http://fake-queue-url/000000000000/nonexistent").await;
+        assert!(result.is_err());
+
+        let error_msg = result.unwrap_err().to_string();
+        // Should mention the queue was not found
+        assert!(
+            error_msg.contains("not found")
+                || error_msg.contains("Queue")
+                || error_msg.contains("verify")
+        );
+
+        container.stop().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_batch_send_multiple_batches() {
+        // Test that messages are correctly batched (10 per batch)
+        let (endpoint, container) = localstack().await.unwrap();
+        let queue_url = create_test_queue(&container, "multi-batch-test", false)
+            .await
+            .unwrap();
+
+        // Create 25 messages (should be 3 batches: 10 + 10 + 5)
+        let messages: Vec<String> = (0..25).map(|i| format!("message-{}", i)).collect();
+        let input = messages.join("\n") + "\n";
+
+        let reader = tokio::io::BufReader::new(std::io::Cursor::new(input.into_bytes()));
+        let (handle, rx) = concurrent_lines(reader, 100);
+
+        let sqs = SqsBatch::local(&queue_url, Some(endpoint)).await;
+        sqs.send(rx).await;
+        handle.await.unwrap();
+
+        // Receive all messages (may need multiple receives)
+        let client = aws_sdk_sqs::Client::new(&sqs.aws_config);
+        let mut all_messages = Vec::new();
+
+        for _ in 0..5 {
+            // Try multiple times to get all messages
+            let output = client
+                .receive_message()
+                .queue_url(&queue_url)
+                .max_number_of_messages(10)
+                .send()
+                .await
+                .unwrap();
+
+            if let Some(msgs) = output.messages {
+                all_messages.extend(msgs);
+            }
+
+            if all_messages.len() >= 25 {
+                break;
+            }
+        }
+
+        assert_eq!(all_messages.len(), 25);
+
+        container.stop().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_empty_messages_filtered() {
+        let (endpoint, container) = localstack().await.unwrap();
+        let queue_url = create_test_queue(&container, "empty-filter-test", false)
+            .await
+            .unwrap();
+
+        // Input with empty lines that should be filtered
+        let input = b"valid1\n\n\nvalid2\n\n".to_vec();
+        let reader = tokio::io::BufReader::new(std::io::Cursor::new(input));
+        let (handle, rx) = concurrent_lines(reader, 10);
+
+        let sqs = SqsBatch::local(&queue_url, Some(endpoint)).await;
+        sqs.send(rx).await;
+        handle.await.unwrap();
+
+        let client = aws_sdk_sqs::Client::new(&sqs.aws_config);
+        let output = client
+            .receive_message()
+            .queue_url(&queue_url)
+            .max_number_of_messages(10)
+            .send()
+            .await
+            .unwrap();
+
+        let messages = output.messages.unwrap_or_default();
+        // Only 2 valid messages should be sent
+        assert_eq!(messages.len(), 2);
+
+        let bodies: Vec<&str> = messages.iter().filter_map(|m| m.body()).collect();
+        assert!(bodies.contains(&"valid1"));
+        assert!(bodies.contains(&"valid2"));
+
+        container.stop().await.unwrap();
     }
 }

@@ -811,13 +811,15 @@ impl Database {
         let mut batch: Vec<Value> = Vec::with_capacity(1000);
 
         for line in reader.lines() {
-            let line = line?;
-            if line.trim().is_empty() {
+            let line = line?
+                .trim_matches(|c: char| c == '"' || c == '\'' || c == ' ' || c == '\n' || c == '\r')
+                .to_string();
+            if line.is_empty() {
                 continue;
             }
 
             // Store the line as-is (could be text or JSON, we store it as a JSON string)
-            let input_value = serde_json::Value::String(line);
+            let input_value = serde_json::from_str::<Value>(&line)?;
             batch.push(input_value);
             count += 1;
 
