@@ -28,28 +28,11 @@ pub struct DeadLetterQueue {
 }
 
 impl DeadLetterQueue {
-    pub async fn new(
-        credentials: Option<aws_sdk_sqs::config::Credentials>,
-        endpoint: Option<&str>,
-        queue_url: Option<&str>,
-    ) -> Self {
-        let mut loader = aws_config::from_env().region(
-            // supports loading region from known env variables
-            aws_config::meta::region::RegionProviderChain::default_provider()
-                .or_else(aws_config::Region::from_static("us-east-1")),
-        );
-
-        if let Some(x) = credentials {
-            loader = loader.credentials_provider(x);
-        }
-
-        if let Some(endpoint) = endpoint {
-            loader = loader.endpoint_url(endpoint);
-        }
-
-        let config = loader.load().await;
-        let client = aws_sdk_sqs::Client::new(&config);
-
+    /// Create a DeadLetterQueue from a pre-built AWS SDK config.
+    /// This is the preferred constructor as it allows the caller to configure
+    /// credentials and endpoints based on their needs (e.g., --local flag).
+    pub fn from_config(config: SdkConfig, queue_url: Option<&str>) -> Self {
+        let client = sqs::Client::new(&config);
         Self {
             config,
             client,

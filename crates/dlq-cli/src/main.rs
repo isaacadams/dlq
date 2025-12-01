@@ -1,3 +1,4 @@
+use aws_config::SdkConfig;
 use clap::{Parser, Subcommand};
 use dlq::DeadLetterQueue;
 
@@ -19,20 +20,49 @@ pub async fn main() {
 #[command(name = "dlq")]
 #[command(about = "aws dead letter queue CLI client written in rust", long_about = None)]
 pub struct Cli {
-    /// AWS access key ID
-    #[arg(long)]
-    access_key_id: Option<String>,
+    /// Use local development mode (test credentials + localhost:4566 endpoint)
+    #[arg(long, global = true)]
+    local: bool,
 
-    /// AWS secret access key
-    #[arg(long)]
-    secret_access_key: Option<String>,
-
-    /// AWS endpoint
-    #[arg(long)]
+    /// AWS endpoint URL (overrides default, works with --local)
+    #[arg(long, global = true)]
     endpoint: Option<String>,
 
     #[command(subcommand)]
     command: Commands,
+}
+
+/// Load AWS SDK configuration based on CLI flags.
+/// - If `local` is true: uses test credentials ("test"/"test") and localhost:4566 endpoint
+/// - If `endpoint` is provided, it overrides the default endpoint
+/// - Otherwise: loads credentials from the standard AWS environment/config chain
+pub async fn load_aws_config(local: bool, endpoint: Option<&str>) -> SdkConfig {
+    let mut loader = aws_config::from_env().region(
+        aws_config::meta::region::RegionProviderChain::default_provider()
+            .or_else(aws_config::Region::from_static("us-east-1")),
+    );
+
+    if local {
+        // Use test credentials for local development (e.g., LocalStack)
+        loader = loader.credentials_provider(aws_sdk_sqs::config::Credentials::new(
+            "test", "test", None, None, "static",
+        ));
+    }
+
+    // Determine endpoint: explicit flag > local default > none
+    let effective_endpoint = endpoint.map(|s| s.to_string()).or_else(|| {
+        if local {
+            Some("http://localhost:4566".to_string())
+        } else {
+            None
+        }
+    });
+
+    if let Some(ep) = effective_endpoint {
+        loader = loader.endpoint_url(ep);
+    }
+
+    loader.load().await
 }
 
 #[derive(Debug, Subcommand)]
@@ -81,11 +111,9 @@ enum Commands {
 
 impl Cli {
     pub async fn run(self) -> anyhow::Result<()> {
-        let credentials = credentials(
-            self.access_key_id.as_deref(),
-            self.secret_access_key.as_deref(),
-        );
-        let dlq = DeadLetterQueue::new(credentials, self.endpoint.as_deref(), None).await;
+        // Load AWS config once, based on global flags
+        let aws_config = load_aws_config(self.local, self.endpoint.as_deref()).await;
+        let dlq = DeadLetterQueue::from_config(aws_config.clone(), None);
 
         match self.command {
             Commands::Info => {
@@ -122,7 +150,7 @@ impl Cli {
             Commands::Poll { url } => {
                 dlq.poll(url.as_deref()).await;
             }
-            Commands::Send => send::run().await,
+            Commands::Send => send::run(aws_config).await,
             Commands::SendBatch {
                 job_id,
                 queue_url,
@@ -132,9 +160,9 @@ impl Cli {
                 retry_limit,
             } => {
                 send::run_batch(
+                    aws_config,
                     job_id,
                     &queue_url,
-                    self.endpoint.as_deref(),
                     batch_size.min(10), // SQS max is 10
                     stage_size,
                     concurrency,
@@ -151,17 +179,5 @@ impl Cli {
         };
 
         Ok(())
-    }
-}
-
-pub fn credentials(
-    access_key_id: Option<&str>,
-    secret_access_key: Option<&str>,
-) -> Option<aws_sdk_sqs::config::Credentials> {
-    match (access_key_id, secret_access_key) {
-        (Some(key), Some(secret)) => Some(aws_sdk_sqs::config::Credentials::new(
-            key, secret, None, None, "static",
-        )),
-        _ => None,
     }
 }

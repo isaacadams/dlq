@@ -5,16 +5,17 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-pub async fn run() {
+pub async fn run(aws_config: aws_config::SdkConfig) {
     let (h_stdin, rx_stdin) = crate::reader::concurrent_lines(tokio::io::stdin(), 100);
 
-    SqsBatch::local(
-        "http://sqs.us-east-1.localhost.localstack.cloud:4566/000000000000/demo",
-        Some("http://localhost:4566"),
-    )
-    .await
-    .send(rx_stdin)
-    .await;
+    // Default queue URL for interactive send mode
+    let queue_url = std::env::var("DLQ_URL").unwrap_or_else(|_| {
+        "http://sqs.us-east-1.localhost.localstack.cloud:4566/000000000000/demo".to_string()
+    });
+
+    SqsBatch::from_config(aws_config, &queue_url)
+        .send(rx_stdin)
+        .await;
 
     if let Err(e) = h_stdin.await {
         eprintln!("error from stdin: {e}");
@@ -108,9 +109,9 @@ async fn verify_queue_exists(client: &aws_sdk_sqs::Client, queue_url: &str) -> a
 
 /// Run batch send from database with streaming architecture
 pub async fn run_batch(
+    aws_config: aws_config::SdkConfig,
     job_id: i64,
     queue_url: &str,
-    endpoint: Option<&str>,
     batch_size: usize,
     stage_size: Option<i64>,
     concurrency: usize,
@@ -133,7 +134,7 @@ pub async fn run_batch(
     }
 
     // Create SQS client early to verify queue exists
-    let sqs = SqsBatch::local(queue_url, endpoint).await;
+    let sqs = SqsBatch::from_config(aws_config, queue_url);
     let client = Arc::new(aws_sdk_sqs::Client::new(&sqs.aws_config));
 
     // Verify the queue exists before processing
@@ -662,6 +663,19 @@ pub struct SqsBatch {
 }
 
 impl SqsBatch {
+    /// Create an SqsBatch from a pre-built AWS SDK config.
+    /// This is the preferred constructor for production use.
+    pub fn from_config(aws_config: aws_config::SdkConfig, aws_sqs_queue_url: &str) -> Self {
+        Self {
+            aws_config,
+            aws_sqs_queue_url: aws_sqs_queue_url.to_string(),
+        }
+    }
+
+    /// Create an SqsBatch configured for local development (e.g., LocalStack).
+    /// Uses test credentials and localhost endpoint.
+    /// Kept for test convenience.
+    #[cfg(test)]
     pub async fn local(aws_sqs_queue_url: &str, aws_endpoint: Option<impl Into<String>>) -> Self {
         let endpoint = aws_endpoint
             .map(|s| s.into())
@@ -670,7 +684,6 @@ impl SqsBatch {
 
         let mut loader = aws_config::from_env()
             .region(
-                // supports loading region from known env variables
                 aws_config::meta::region::RegionProviderChain::default_provider()
                     .or_else(aws_config::Region::from_static("us-east-1")),
             )
