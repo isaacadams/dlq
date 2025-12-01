@@ -32,6 +32,6 @@ async-channel = "2"
 [dev-dependencies]
 assert_cmd = "2.0"
 predicates = "3.1"
-testcontainers = "0.25"
-testcontainers-modules = { version = "0.13", features = ["localstack"] }
+testcontainers = "0.26"
+testcontainers-modules = { version = "0.14", features = ["localstack"] }
 tokio-test = "0.4.4"
