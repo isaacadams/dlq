@@ -12,19 +12,37 @@ use tokio::sync::OnceCell;
 
 #[derive(Debug, clap::Subcommand)]
 pub enum JobCommands {
+    List,
     Status { id: i64 },
 }
 
 impl JobCommands {
-    pub async fn run(self) -> anyhow::Result<()> {
+    pub async fn run(self) -> Result<(), sqlx::Error> {
         match self {
+            JobCommands::List => {
+                let db = Database::new().await?;
+                let jobs = db.list_jobs().await?;
+                println!("Jobs:");
+                for job in jobs {
+                    println!(
+                        "[{}] {} #{}",
+                        job.timestamp_start.format("%Y-%m-%d %H:%M:%S").to_string(),
+                        job.name,
+                        job.id
+                    );
+                }
+            }
             JobCommands::Status { id } => {
-                let db = Database::new().await.unwrap();
-                let count = db.check_and_close_job(id).await.unwrap();
-                if let Some(count) = count {
-                    println!("{} job items are incomplete.", count);
-                } else {
-                    println!("job complete.");
+                let db = Database::new().await?;
+                let counts = db.check_job_status(id).await?;
+
+                println!(
+                    "Job ID: {}\nTotal Items: {}\n",
+                    id,
+                    counts.iter().map(|(_, count)| count).sum::<i64>()
+                );
+                for (status, count) in counts {
+                    println!("{}: {}", status, count);
                 }
             }
         }
@@ -59,8 +77,18 @@ impl DatabaseCommands {
     }
 }
 
-#[derive(Debug)]
-pub struct JobItem {
+#[derive(Debug, sqlx::FromRow)]
+pub struct JobModel {
+    pub id: i64,
+    pub name: String,
+    pub timestamp_start: sqlx::types::chrono::DateTime<sqlx::types::chrono::Utc>,
+    pub timestamp_end: Option<sqlx::types::chrono::DateTime<sqlx::types::chrono::Utc>>,
+}
+
+#[derive(Debug, sqlx::FromRow)]
+pub struct JobItemModel {
+    pub id: i64,
+    pub job_id: i64,
     pub input: Value,
     pub output: Option<Value>,
     pub error: Option<String>,
@@ -150,6 +178,11 @@ impl Database {
         Ok(Self { pool })
     }
 
+    pub async fn list_jobs(&self) -> Result<Vec<JobModel>, sqlx::Error> {
+        sqlx::query_as::<_, JobModel>("SELECT id, name, timestamp_start, timestamp_end FROM jobs")
+            .fetch_all(self.pool)
+            .await
+    }
     /// Creates a new job and returns its ID.
     pub async fn create_job(&self, name: &str) -> Result<i64, sqlx::Error> {
         let row = sqlx::query(
@@ -173,7 +206,7 @@ impl Database {
     pub async fn enqueue_job_items(
         &self,
         job_id: i64,
-        mut items: Vec<JobItem>,
+        mut items: Vec<JobItemModel>,
     ) -> Result<(), sqlx::Error> {
         const BATCH_SIZE: usize = 1000; // Tune based on memory; SQLite handles ~10k/sec inserts with WAL
 
@@ -289,6 +322,25 @@ impl Database {
         .await?;
 
         Ok(())
+    }
+
+    pub async fn check_job_status(&self, job_id: i64) -> Result<Vec<(String, i64)>, sqlx::Error> {
+        let rows = sqlx::query(
+            r#"
+        SELECT status, COUNT(*) as count
+        FROM job_items
+        WHERE job_id = $1
+        GROUP BY status
+        "#,
+        )
+        .bind(job_id)
+        .fetch_all(self.pool)
+        .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(|row| (row.get("status"), row.get("count")))
+            .collect::<Vec<(String, i64)>>())
     }
 
     /// Checks if a job is complete (all items 'done' or 'failed') and updates timestamp_end if so.
