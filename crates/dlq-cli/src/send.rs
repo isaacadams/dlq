@@ -108,6 +108,7 @@ async fn verify_queue_exists(client: &aws_sdk_sqs::Client, queue_url: &str) -> a
 }
 
 /// Run batch send from database with streaming architecture
+#[allow(clippy::too_many_arguments)]
 pub async fn run_batch(
     aws_config: aws_config::SdkConfig,
     job_id: i64,
