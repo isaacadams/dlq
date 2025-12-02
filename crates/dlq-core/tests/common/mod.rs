@@ -48,3 +48,14 @@ pub fn create_or_get_queue_url(queue_name: &str) -> String {
 
     queue_url
 }
+
+pub async fn local_aws_config() -> aws_config::SdkConfig {
+    aws_config::defaults(aws_config::BehaviorVersion::latest())
+        .credentials_provider(aws_sdk_sqs::config::Credentials::new(
+            "test", "test", None, None, "static",
+        ))
+        .endpoint_url("http://localhost:4566")
+        .region("us-east-1")
+        .load()
+        .await
+}

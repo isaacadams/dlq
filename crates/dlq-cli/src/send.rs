@@ -1,0 +1,1320 @@
+//! Batch message sending functionality for the CLI.
+//!
+//! This module provides both interactive and batch sending capabilities:
+//!
+//! - **Interactive mode**: Reads lines from stdin and sends them to SQS
+//! - **Batch mode**: Processes job items from SQLite and sends to SQS with
+//!   concurrency, progress tracking, and retry support
+
+use crate::database::Database;
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+use serde_json::Value;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+
+/// Runs the interactive send mode.
+///
+/// Reads lines from stdin and sends them to SQS using the pipeline.
+///
+/// # Arguments
+///
+/// * `aws_config` - AWS SDK configuration
+/// * `queue_url` - The URL of the SQS queue to send messages to
+pub async fn run(aws_config: aws_config::SdkConfig, queue_url: &str) {
+    let (h_stdin, rx_stdin) = crate::reader::concurrent_lines(tokio::io::stdin(), 100);
+
+    SqsBatch::from_config(aws_config, queue_url)
+        .send(rx_stdin)
+        .await;
+
+    if let Err(e) = h_stdin.await {
+        eprintln!("error from stdin: {e}");
+    }
+}
+
+/// Represents a job item with its database ID for tracking results.
+///
+/// Used internally to associate SQS send results back to database records.
+#[derive(Debug, Clone)]
+struct JobItem {
+    /// Database ID for this item (from job_items table)
+    db_id: i64,
+    /// The message content to send
+    input: Value,
+}
+
+/// Result of sending an item to SQS.
+///
+/// Captures the outcome of a send operation for database recording.
+#[derive(Debug, Clone)]
+struct SendResult {
+    /// Database ID of the original item
+    db_id: i64,
+    /// Whether the send was successful
+    success: bool,
+    /// SQS response data (message ID, MD5, etc.) or error details
+    output: Option<Value>,
+    /// Error message if the send failed
+    error: Option<String>,
+    /// Batch ID this item was sent in (for debugging/correlation)
+    #[allow(dead_code)]
+    batch_id: String,
+}
+
+/// Verifies that the given queue URL exists, or returns a helpful error with available queues.
+///
+/// Attempts to get queue attributes to confirm the queue exists. If the queue doesn't exist,
+/// lists available queues and returns an error message with suggestions for the user.
+///
+/// # Arguments
+///
+/// * `client` - The SQS client to use
+/// * `queue_url` - The queue URL to verify
+///
+/// # Returns
+///
+/// * `Ok(())` - The queue exists
+/// * `Err(anyhow::Error)` - The queue doesn't exist or another error occurred
+async fn verify_queue_exists(client: &aws_sdk_sqs::Client, queue_url: &str) -> anyhow::Result<()> {
+    // Try to get queue attributes to verify it exists
+    match client
+        .get_queue_attributes()
+        .queue_url(queue_url)
+        .attribute_names(aws_sdk_sqs::types::QueueAttributeName::QueueArn)
+        .send()
+        .await
+    {
+        Ok(_) => Ok(()),
+        Err(e) => {
+            // Check if it's a queue not found error
+            let is_not_found = if let aws_sdk_sqs::error::SdkError::ServiceError(se) = &e {
+                let err_str = format!("{}", se.err());
+                err_str.contains("NonExistentQueue")
+                    || err_str.contains("QueueDoesNotExist")
+                    || err_str.contains("does not exist")
+            } else {
+                false
+            };
+
+            if is_not_found {
+                // List available queues to help the user
+                let mut available_queues = Vec::new();
+                let mut list_result = client.list_queues().send().await;
+
+                while let Ok(output) = list_result {
+                    if let Some(urls) = output.queue_urls {
+                        available_queues.extend(urls);
+                    }
+                    match output.next_token {
+                        Some(token) => {
+                            list_result = client.list_queues().next_token(token).send().await;
+                        }
+                        None => break,
+                    }
+                }
+
+                let mut error_msg = format!("Queue not found: {}\n\n", queue_url);
+
+                if available_queues.is_empty() {
+                    error_msg.push_str("No queues are currently available.\n\n");
+                    error_msg.push_str("To create a new queue, you can use the AWS CLI:\n");
+                    error_msg.push_str("  aws sqs create-queue --queue-name <your-queue-name>\n\n");
+                    error_msg.push_str("Or with LocalStack:\n");
+                    error_msg.push_str("  aws --endpoint-url=http://localhost:4566 sqs create-queue --queue-name <your-queue-name>");
+                } else {
+                    error_msg.push_str("Available queues:\n");
+                    for (i, url) in available_queues.iter().enumerate() {
+                        // Extract queue name from URL for cleaner display
+                        let name = url.rsplit('/').next().unwrap_or(url);
+                        error_msg.push_str(&format!("  {}. {} \n     {}\n", i + 1, name, url));
+                    }
+                    error_msg.push_str("\nTo create a new queue, use the AWS CLI:\n");
+                    error_msg.push_str("  aws sqs create-queue --queue-name <your-queue-name>");
+                }
+
+                Err(anyhow::anyhow!("{}", error_msg))
+            } else {
+                // Some other error occurred
+                Err(anyhow::anyhow!("Failed to verify queue: {:?}", e))
+            }
+        }
+    }
+}
+
+/// Runs batch send from database with streaming architecture.
+///
+/// Implements a high-throughput pipeline for sending job items to SQS:
+///
+/// 1. **Loader Task**: Stages pending items from SQLite in batches
+/// 2. **Sender Workers**: Concurrently send batches to SQS
+/// 3. **Writer Task**: Records results back to SQLite
+///
+/// Uses channels to decouple stages for maximum throughput while maintaining
+/// back-pressure to avoid memory issues.
+///
+/// # Arguments
+///
+/// * `aws_config` - AWS SDK configuration
+/// * `job_id` - ID of the job to process (must have name='send_batch')
+/// * `queue_url` - SQS queue URL to send messages to
+/// * `batch_size` - Messages per SQS batch (max 10)
+/// * `stage_size` - Items to stage from SQLite per round (auto-optimized if None)
+/// * `concurrency` - Number of parallel sender workers
+/// * `_retry_limit` - Max retries per item (currently unused)
+/// * `limit` - Maximum items to process (all if None)
+/// * `dry_run` - If true, preview without sending
+///
+/// # Returns
+///
+/// * `Ok(())` - Job completed successfully
+/// * `Err(anyhow::Error)` - An error occurred
+#[allow(clippy::too_many_arguments)]
+pub async fn run_batch(
+    aws_config: aws_config::SdkConfig,
+    job_id: i64,
+    queue_url: &str,
+    batch_size: usize,
+    stage_size: Option<i64>,
+    concurrency: usize,
+    _retry_limit: u32,
+    limit: Option<i64>,
+    dry_run: bool,
+) -> anyhow::Result<()> {
+    let db = Arc::new(Database::new().await?);
+
+    // Verify job exists and has the correct name
+    let job = db
+        .get_job(job_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("Job {} not found", job_id))?;
+
+    if job.name != "send_batch" {
+        return Err(anyhow::anyhow!(
+            "Job {} has name '{}', expected 'send_batch'",
+            job_id,
+            job.name
+        ));
+    }
+
+    // Create SQS client early to verify queue exists (skip in dry run)
+    let sqs = SqsBatch::from_config(aws_config, queue_url);
+    let client = Arc::new(aws_sdk_sqs::Client::new(&sqs.aws_config));
+
+    if !dry_run {
+        // Verify the queue exists before processing
+        verify_queue_exists(&client, queue_url).await?;
+    }
+
+    let config = job.configuration.0;
+    let input_type = Arc::new(config.input_type.clone());
+
+    // Count total pending items for progress bar
+    let total_pending = db.count_pending_items(job_id).await?;
+    if total_pending == 0 {
+        println!("No pending items to process for job {}", job_id);
+        return Ok(());
+    }
+
+    // Apply limit if specified
+    let items_to_process = match limit {
+        Some(l) => total_pending.min(l),
+        None => total_pending,
+    };
+
+    // Auto-optimize stage size if not provided
+    let stage_size = stage_size.unwrap_or({
+        if items_to_process < 1000 {
+            items_to_process
+        } else {
+            1000
+        }
+    });
+
+    if dry_run {
+        println!(
+            "[DRY RUN] Would process job {} ({} of {} pending items, stage_size={}, batch_size={}, concurrency={})\n",
+            job_id, items_to_process, total_pending, stage_size, batch_size, concurrency
+        );
+        return run_batch_dry_run(db, job_id, items_to_process, &input_type).await;
+    }
+
+    println!(
+        "Processing job {} ({} pending items, stage_size={}, batch_size={}, concurrency={})\n",
+        job_id, items_to_process, stage_size, batch_size, concurrency
+    );
+
+    // Setup multi-progress bars
+    let mp = MultiProgress::new();
+
+    // Loading progress bar (items staged from SQLite)
+    let load_style = ProgressStyle::default_bar()
+        .template("{prefix:.bold.dim} {spinner:.green} [{bar:30.white/dim}] {pos}/{len} staged")
+        .unwrap()
+        .progress_chars("━━╸");
+
+    let load_pb = mp.add(ProgressBar::new(items_to_process as u64));
+    load_pb.set_style(load_style);
+    load_pb.set_prefix("SQLite");
+
+    // Create progress bars for each concurrent sender
+    let sender_style = ProgressStyle::default_bar()
+        .template("{prefix:.bold.cyan} {spinner:.blue} [{bar:30.cyan/dim}] {pos} batches sent")
+        .unwrap()
+        .progress_chars("━━╸");
+
+    let sender_pbs: Vec<ProgressBar> = (0..concurrency)
+        .map(|i| {
+            let pb = mp.add(ProgressBar::new_spinner());
+            pb.set_style(sender_style.clone());
+            pb.set_prefix(format!("Worker {}", i + 1));
+            pb.enable_steady_tick(std::time::Duration::from_millis(100));
+            pb
+        })
+        .collect();
+    let sender_pbs = Arc::new(sender_pbs);
+
+    // Completed items progress bar (total items written back to SQLite)
+    let complete_style = ProgressStyle::default_bar()
+        .template("{prefix:.bold.green} {spinner:.green} [{bar:30.green/dim}] {pos}/{len} completed ({percent}%)")
+        .unwrap()
+        .progress_chars("━━╸");
+
+    let complete_pb = mp.add(ProgressBar::new(items_to_process as u64));
+    complete_pb.set_style(complete_style);
+    complete_pb.set_prefix("Total");
+    complete_pb.enable_steady_tick(std::time::Duration::from_millis(100));
+
+    // Channel for streaming items from loader to senders
+    // Buffer size balances memory with throughput
+    let (item_tx, item_rx) = async_channel::bounded::<JobItem>(batch_size * concurrency * 2);
+
+    // Channel for results back to the database writer
+    let (result_tx, mut result_rx) = tokio::sync::mpsc::channel::<SendResult>(1000);
+
+    // Channel for database operations - ALL writes go through this single task
+    enum DbOp {
+        StageRequest {
+            response_tx: tokio::sync::oneshot::Sender<Result<Vec<(i64, Value)>, String>>,
+        },
+    }
+    let (db_tx, mut db_rx) = tokio::sync::mpsc::channel::<DbOp>(100);
+
+    // Shared counters
+    let items_loaded = Arc::new(AtomicU64::new(0));
+    let queue_url = Arc::new(queue_url.to_string());
+
+    // Buffer threshold for batch writes
+    const WRITE_BUFFER_SIZE: usize = 100;
+
+    // Spawn single database task that handles ALL writes
+    // This serializes staging + completions to avoid SQLite lock contention
+    let writer_db = db.clone();
+    let complete_pb_clone = complete_pb.clone();
+    let db_writer_handle = tokio::spawn(async move {
+        use crate::database::CompletionResult;
+
+        let mut completion_buffer: Vec<SendResult> = Vec::with_capacity(WRITE_BUFFER_SIZE);
+        let mut total_completed: u64 = 0;
+
+        loop {
+            tokio::select! {
+                // Handle staging requests (priority)
+                Some(DbOp::StageRequest { response_tx }) = db_rx.recv() => {
+                    // Flush any pending completions first to keep order
+                    if !completion_buffer.is_empty() {
+                        let count = completion_buffer.len();
+                        let results: Vec<CompletionResult> = completion_buffer
+                            .drain(..)
+                            .map(|r| CompletionResult {
+                                id: r.db_id,
+                                output: r.output,
+                                error: if r.success { None } else { r.error },
+                                success: r.success,
+                            })
+                            .collect();
+
+                        if let Err(e) = writer_db.complete_items_batch(results).await {
+                            eprintln!("Error batch completing items: {}", e);
+                        } else {
+                            total_completed += count as u64;
+                            complete_pb_clone.set_position(total_completed);
+                        }
+                    }
+
+                    let result = writer_db
+                        .stage_pending_items(Some(job_id), stage_size)
+                        .await
+                        .map_err(|e| e.to_string());
+                    let _ = response_tx.send(result);
+                }
+                // Collect completion results
+                Some(result) = result_rx.recv() => {
+                    completion_buffer.push(result);
+
+                    // Flush if buffer is full
+                    if completion_buffer.len() >= WRITE_BUFFER_SIZE {
+                        let count = completion_buffer.len();
+                        let results: Vec<CompletionResult> = completion_buffer
+                            .drain(..)
+                            .map(|r| CompletionResult {
+                                id: r.db_id,
+                                output: r.output,
+                                error: if r.success { None } else { r.error },
+                                success: r.success,
+                            })
+                            .collect();
+
+                        if let Err(e) = writer_db.complete_items_batch(results).await {
+                            eprintln!("Error batch completing items: {}", e);
+                        } else {
+                            total_completed += count as u64;
+                            complete_pb_clone.set_position(total_completed);
+                        }
+                    }
+                }
+                // Both channels closed - flush and exit
+                else => {
+                    if !completion_buffer.is_empty() {
+                        let count = completion_buffer.len();
+                        let results: Vec<CompletionResult> = completion_buffer
+                            .drain(..)
+                            .map(|r| CompletionResult {
+                                id: r.db_id,
+                                output: r.output,
+                                error: if r.success { None } else { r.error },
+                                success: r.success,
+                            })
+                            .collect();
+
+                        if let Err(e) = writer_db.complete_items_batch(results).await {
+                            eprintln!("Error batch completing items: {}", e);
+                        } else {
+                            total_completed += count as u64;
+                            complete_pb_clone.set_position(total_completed);
+                        }
+                    }
+                    complete_pb_clone.finish();
+                    break;
+                }
+            }
+        }
+    });
+
+    // Spawn the loader task - requests staging through the db writer
+    let loader_db_tx = db_tx.clone();
+    let load_pb_clone = load_pb.clone();
+    let items_loaded_clone = items_loaded.clone();
+    let items_limit = items_to_process as u64;
+    let loader_handle = tokio::spawn(async move {
+        'loader: loop {
+            // Check if we've reached the limit
+            let current_loaded = items_loaded_clone.load(Ordering::Relaxed);
+            if current_loaded >= items_limit {
+                break 'loader;
+            }
+
+            // Request staging through the serialized db writer
+            let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+            if loader_db_tx
+                .send(DbOp::StageRequest { response_tx })
+                .await
+                .is_err()
+            {
+                break 'loader;
+            }
+
+            let items = match response_rx.await {
+                Ok(Ok(items)) => items,
+                Ok(Err(e)) => {
+                    eprintln!("Error staging items: {}", e);
+                    break 'loader;
+                }
+                Err(_) => break 'loader,
+            };
+
+            if items.is_empty() {
+                break 'loader;
+            }
+
+            for (db_id, input) in items {
+                let item = JobItem { db_id, input };
+                if item_tx.send(item).await.is_err() {
+                    // Receiver dropped, stop loading entirely
+                    break 'loader;
+                }
+                let loaded = items_loaded_clone.fetch_add(1, Ordering::Relaxed) + 1;
+                load_pb_clone.set_position(loaded);
+
+                // Stop if we've reached the limit
+                if loaded >= items_limit {
+                    break 'loader;
+                }
+            }
+        }
+
+        load_pb_clone.finish_with_message("done");
+        // Close the channel to signal completion
+        drop(item_tx);
+    });
+
+    // Spawn sender worker tasks
+    let mut sender_handles = Vec::new();
+    for worker_id in 0..concurrency {
+        let client = client.clone();
+        let queue_url = queue_url.clone();
+        let input_type = input_type.clone();
+        let item_rx = item_rx.clone();
+        let result_tx = result_tx.clone();
+        let pb = sender_pbs[worker_id].clone();
+
+        let handle = tokio::spawn(async move {
+            let mut batches_sent = 0u64;
+
+            loop {
+                // Collect items for a batch
+                let mut batch_items = Vec::with_capacity(batch_size);
+
+                // Try to fill the batch
+                for _ in 0..batch_size {
+                    match item_rx.recv().await {
+                        Ok(item) => batch_items.push(item),
+                        Err(_) => break, // Channel closed
+                    }
+                }
+
+                if batch_items.is_empty() {
+                    break; // No more items
+                }
+
+                // Transform and send batch
+                let batch_id = uuid::Uuid::new_v4().hyphenated().to_string();
+                let mut entries = Vec::with_capacity(batch_items.len());
+                let mut id_to_db_id = HashMap::new();
+
+                for item in &batch_items {
+                    let (message_id, message_body) = transform_input(&item.input, &input_type);
+                    id_to_db_id.insert(message_id.clone(), item.db_id);
+
+                    if let Ok(entry) = aws_sdk_sqs::types::SendMessageBatchRequestEntry::builder()
+                        .id(&message_id)
+                        .message_body(message_body)
+                        .build()
+                    {
+                        entries.push((message_id, entry));
+                    }
+                }
+
+                if entries.is_empty() {
+                    continue;
+                }
+
+                let entry_list: Vec<_> = entries.iter().map(|(_, e)| e.clone()).collect();
+                let entry_ids: Vec<_> = entries.iter().map(|(id, _)| id.clone()).collect();
+
+                // Send to SQS
+                match client
+                    .send_message_batch()
+                    .queue_url(queue_url.as_ref())
+                    .set_entries(Some(entry_list))
+                    .send()
+                    .await
+                {
+                    Ok(output) => {
+                        // Process successful entries
+                        for success in output.successful() {
+                            if let Some(&db_id) = id_to_db_id.get(success.id()) {
+                                let _ = result_tx
+                                    .send(SendResult {
+                                        db_id,
+                                        success: true,
+                                        output: Some(serde_json::json!({
+                                            "message_id": success.message_id(),
+                                            "md5_of_message_body": success.md5_of_message_body(),
+                                            "sequence_number": success.sequence_number(),
+                                            "batch_id": batch_id,
+                                        })),
+                                        error: None,
+                                        batch_id: batch_id.clone(),
+                                    })
+                                    .await;
+                            }
+                        }
+
+                        // Process failed entries
+                        for failed in output.failed() {
+                            if let Some(&db_id) = id_to_db_id.get(failed.id()) {
+                                let _ = result_tx
+                                    .send(SendResult {
+                                        db_id,
+                                        success: false,
+                                        output: Some(serde_json::json!({
+                                            "code": failed.code(),
+                                            "message": failed.message(),
+                                            "sender_fault": failed.sender_fault(),
+                                            "batch_id": batch_id,
+                                        })),
+                                        error: Some(format!(
+                                            "{}: {}",
+                                            failed.code(),
+                                            failed.message().unwrap_or("Unknown error")
+                                        )),
+                                        batch_id: batch_id.clone(),
+                                    })
+                                    .await;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        let (error_msg, error_details) = format_sdk_error(&e);
+                        for entry_id in entry_ids {
+                            if let Some(&db_id) = id_to_db_id.get(&entry_id) {
+                                let _ = result_tx
+                                    .send(SendResult {
+                                        db_id,
+                                        success: false,
+                                        output: Some(serde_json::json!({
+                                            "error_details": error_details,
+                                            "batch_id": batch_id,
+                                        })),
+                                        error: Some(error_msg.clone()),
+                                        batch_id: batch_id.clone(),
+                                    })
+                                    .await;
+                            }
+                        }
+                    }
+                }
+
+                batches_sent += 1;
+                pb.set_position(batches_sent);
+            }
+
+            pb.finish_with_message("done");
+        });
+
+        sender_handles.push(handle);
+    }
+
+    // Drop our copies of channels so they close when tasks are done
+    drop(result_tx);
+    drop(db_tx);
+
+    // Wait for loader to finish
+    let _ = loader_handle.await;
+
+    // Wait for all senders to finish
+    for handle in sender_handles {
+        let _ = handle.await;
+    }
+
+    // Wait for db writer to finish (it will exit when both channels close)
+    let _ = db_writer_handle.await;
+
+    // Clear intermediate progress bars, keep the completion bar
+    load_pb.finish_and_clear();
+    for pb in sender_pbs.iter() {
+        pb.finish_and_clear();
+    }
+
+    // The complete_pb was already finished in the db_writer task
+    // Just add a newline for clean output
+    println!();
+
+    // Check and close job if complete
+    match db.check_and_close_job(job_id).await? {
+        None => println!("✓ Job {} completed successfully", job_id),
+        Some(remaining) => println!(
+            "Job {} still has {} items pending/processing",
+            job_id, remaining
+        ),
+    }
+
+    Ok(())
+}
+
+/// Run a dry-run of batch send - shows what would be sent without making changes
+async fn run_batch_dry_run(
+    db: Arc<Database>,
+    job_id: i64,
+    limit: i64,
+    input_type: &str,
+) -> anyhow::Result<()> {
+    // Fetch items without staging them (just peek at pending items)
+    let items = db.peek_pending_items(job_id, limit).await?;
+
+    if items.is_empty() {
+        println!("[DRY RUN] No pending items found");
+        return Ok(());
+    }
+
+    println!("[DRY RUN] Would send {} items:\n", items.len());
+
+    for (i, (db_id, input)) in items.iter().enumerate() {
+        let (message_id, message_body) = transform_input(input, input_type);
+
+        // Truncate body for display if too long
+        let display_body = if message_body.len() > 100 {
+            format!("{}...", &message_body[..100])
+        } else {
+            message_body
+        };
+
+        println!(
+            "  {}. [id={}] message_id={}\n     body: {}",
+            i + 1,
+            db_id,
+            message_id,
+            display_body
+        );
+    }
+
+    println!("\n[DRY RUN] No messages were sent. Remove --dry-run to send for real.");
+    Ok(())
+}
+
+/// Format an SDK error into a detailed error message and JSON details
+fn format_sdk_error(
+    e: &aws_sdk_sqs::error::SdkError<
+        aws_sdk_sqs::operation::send_message_batch::SendMessageBatchError,
+    >,
+) -> (String, Value) {
+    use aws_sdk_sqs::error::SdkError;
+
+    match e {
+        SdkError::ServiceError(se) => {
+            let err = se.err();
+            let raw = se.raw();
+
+            let error_msg = format!("SQS ServiceError: {}", err);
+            let details = serde_json::json!({
+                "error_type": "ServiceError",
+                "message": format!("{}", err),
+                "status_code": raw.status().as_u16(),
+                "request_id": raw.headers()
+                    .get("x-amzn-requestid")
+                    .map(|v| v.to_string()),
+            });
+            (error_msg, details)
+        }
+        SdkError::TimeoutError(te) => {
+            let error_msg = format!("SQS TimeoutError: {:?}", te);
+            let details = serde_json::json!({
+                "error_type": "TimeoutError",
+                "message": format!("{:?}", te),
+            });
+            (error_msg, details)
+        }
+        SdkError::DispatchFailure(df) => {
+            let error_msg = format!("SQS DispatchFailure: {:?}", df);
+            let details = serde_json::json!({
+                "error_type": "DispatchFailure",
+                "message": format!("{:?}", df),
+                "is_io": df.is_io(),
+                "is_timeout": df.is_timeout(),
+                "is_user": df.is_user(),
+                "connector_error": df.as_connector_error().map(|ce| format!("{:?}", ce)),
+            });
+            (error_msg, details)
+        }
+        SdkError::ResponseError(re) => {
+            let raw = re.raw();
+            let error_msg = format!("SQS ResponseError: status={}", raw.status().as_u16());
+            let details = serde_json::json!({
+                "error_type": "ResponseError",
+                "status_code": raw.status().as_u16(),
+                "debug": format!("{:?}", re),
+            });
+            (error_msg, details)
+        }
+        SdkError::ConstructionFailure(cf) => {
+            let error_msg = format!("SQS ConstructionFailure: {:?}", cf);
+            let details = serde_json::json!({
+                "error_type": "ConstructionFailure",
+                "message": format!("{:?}", cf),
+            });
+            (error_msg, details)
+        }
+        _ => {
+            let error_msg = format!("SQS Error: {:?}", e);
+            let details = serde_json::json!({
+                "error_type": "Unknown",
+                "debug": format!("{:?}", e),
+            });
+            (error_msg, details)
+        }
+    }
+}
+
+/// Transform input value to (message_id, message_body) based on input_type
+fn transform_input(input: &Value, input_type: &str) -> (String, String) {
+    match input_type {
+        "json" => {
+            // JSON mode: extract id and body fields
+            if let Value::Object(map) = input {
+                let id = map
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| uuid::Uuid::new_v4().hyphenated().to_string());
+
+                let body = map
+                    .get("body")
+                    .map(|v| {
+                        if let Value::String(s) = v {
+                            s.clone()
+                        } else {
+                            serde_json::to_string(v).unwrap_or_default()
+                        }
+                    })
+                    .unwrap_or_else(|| serde_json::to_string(input).unwrap_or_default());
+
+                (id, body)
+            } else {
+                // Fallback: treat as text
+                let id = uuid::Uuid::new_v4().hyphenated().to_string();
+                let body = serde_json::to_string(input).unwrap_or_default();
+                (id, body)
+            }
+        }
+        _ => {
+            // TEXT mode (default): input is raw text, generate UUID for message ID
+            let id = uuid::Uuid::new_v4().hyphenated().to_string();
+            let body = match input {
+                Value::String(s) => s.clone(),
+                _ => serde_json::to_string(input).unwrap_or_default(),
+            };
+            (id, body)
+        }
+    }
+}
+
+/// Client for sending messages to SQS in batches via a streaming pipeline.
+///
+/// Uses the `pumps` library to create an efficient pipeline that:
+/// - Filters empty messages
+/// - Batches messages (10 per batch, the SQS maximum)
+/// - Sends batches concurrently
+pub struct SqsBatch {
+    /// AWS SDK configuration
+    pub aws_config: aws_config::SdkConfig,
+    /// Target SQS queue URL
+    pub aws_sqs_queue_url: String,
+}
+
+impl SqsBatch {
+    /// Create an SqsBatch from a pre-built AWS SDK config.
+    /// This is the preferred constructor for production use.
+    pub fn from_config(aws_config: aws_config::SdkConfig, aws_sqs_queue_url: &str) -> Self {
+        Self {
+            aws_config,
+            aws_sqs_queue_url: aws_sqs_queue_url.to_string(),
+        }
+    }
+
+    /// Create an SqsBatch configured for local development (e.g., LocalStack).
+    /// Uses test credentials and localhost endpoint.
+    /// Kept for test convenience.
+    #[cfg(test)]
+    pub async fn local(aws_sqs_queue_url: &str, aws_endpoint: Option<impl Into<String>>) -> Self {
+        let endpoint = aws_endpoint
+            .map(|s| s.into())
+            .or(std::env::var("AWS_ENDPOINT").ok())
+            .or(Some("http://localhost:4566".into()));
+
+        let mut loader = aws_config::from_env()
+            .region(
+                aws_config::meta::region::RegionProviderChain::default_provider()
+                    .or_else(aws_config::Region::from_static("us-east-1")),
+            )
+            .credentials_provider(aws_sdk_sqs::config::Credentials::new(
+                "test", "test", None, None, "static",
+            ));
+
+        if let Some(endpoint) = endpoint {
+            loader = loader.endpoint_url(endpoint);
+        }
+
+        Self {
+            aws_config: loader.load().await,
+            aws_sqs_queue_url: aws_sqs_queue_url.to_string(),
+        }
+    }
+
+    /// Sends messages from a channel receiver to SQS.
+    ///
+    /// Consumes strings from the receiver, batches them, and sends to SQS
+    /// with concurrent processing. Empty strings are filtered out.
+    ///
+    /// # Arguments
+    ///
+    /// * `rx` - Channel receiver providing message strings
+    pub async fn send(&self, rx: tokio::sync::mpsc::Receiver<String>) {
+        let client = std::sync::Arc::new(aws_sdk_sqs::Client::new(&self.aws_config));
+        let aws_sqs_queue_url = std::sync::Arc::new(self.aws_sqs_queue_url.clone());
+
+        use pumps::{Concurrency, Pipeline};
+        let (mut rx_pipeline, h_pipeline) = Pipeline::from(rx)
+            .filter_map(
+                |x| async move {
+                    if x.is_empty() {
+                        return None;
+                    }
+
+                    println!("{}", x);
+
+                    // BatchId is a wrapper around a string that validates the ID is a valid SQS batch ID
+                    // BatchId::new(uuid::Uuid::new_v4().to_string()).unwrap().0
+                    let id = uuid::Uuid::new_v4().hyphenated().to_string();
+                    let entry = aws_sdk_sqs::types::SendMessageBatchRequestEntry::builder()
+                        .id(id)
+                        .message_body(x)
+                        .build()
+                        .unwrap();
+
+                    println!("entry: {:#?}", entry);
+                    Some(entry)
+                },
+                Concurrency::serial(),
+            )
+            .batch(10)
+            .map(
+                move |entries| {
+                    let client = client.clone();
+                    let aws_sqs_queue_url = aws_sqs_queue_url.clone();
+                    async move {
+                        job(&client, aws_sqs_queue_url.as_ref(), entries).await;
+                    }
+                },
+                // SQS batch sends are inherently unordered in results (failed items can come back in any order)
+                // using unordered concurrency gives better throughput
+                Concurrency::concurrent_unordered(10),
+            )
+            .build();
+
+        while rx_pipeline.recv().await.is_some() {}
+
+        if let Err(e) = h_pipeline.await {
+            eprintln!("error from pipeline: {e}");
+        }
+    }
+}
+
+/// Sends a batch of message entries to SQS.
+///
+/// Logs the response on success or the error on failure.
+///
+/// # Arguments
+///
+/// * `client` - The SQS client
+/// * `queue_url` - Target queue URL
+/// * `entries` - Message entries to send (max 10)
+async fn job(
+    client: &aws_sdk_sqs::Client,
+    queue_url: &str,
+    entries: Vec<aws_sdk_sqs::types::SendMessageBatchRequestEntry>,
+) {
+    match client
+        .send_message_batch()
+        .queue_url(queue_url)
+        .set_entries(Some(entries))
+        .send()
+        .await
+    {
+        Ok(output) => {
+            println!("output: {:#?}", output);
+        }
+        Err(e) => {
+            if let aws_sdk_sqs::error::SdkError::ServiceError(se) = &e {
+                let err = se.err();
+                // This prints the primary AWS service error message (e.g., from the XML/JSON response)
+                eprintln!("[AWS SDK ERROR] {}", err);
+            } else {
+                // Fallback for non-service errors (e.g., timeout, dispatch failure)
+                eprintln!("[AWS SDK ERROR] {}", e);
+            }
+        }
+    }
+}
+
+/// Validation utilities for SQS message IDs.
+#[allow(dead_code)]
+mod validation {
+    use std::convert::Into;
+
+    /// A validated SQS batch message ID.
+    ///
+    /// SQS batch entry IDs must be:
+    /// - Non-empty
+    /// - At most 80 characters
+    /// - Only contain alphanumeric characters, hyphens (-), and underscores (_)
+    #[derive(Debug, Clone)]
+    pub struct BatchId(String);
+
+    impl BatchId {
+        /// Creates a new BatchId after validating the input.
+        ///
+        /// # Arguments
+        ///
+        /// * `id` - The ID string to validate
+        ///
+        /// # Returns
+        ///
+        /// * `Ok(BatchId)` - The ID is valid
+        /// * `Err(String)` - Validation error message
+        pub fn new<S: Into<String>>(id: S) -> Result<Self, String> {
+            let id_str = id.into();
+            if id_str.is_empty() {
+                return Err("Batch ID cannot be empty".to_string());
+            }
+            if id_str.len() > 80 {
+                return Err(format!(
+                    "Batch ID exceeds maximum length: {} > 80 characters",
+                    id_str.len()
+                ));
+            }
+            for c in id_str.chars() {
+                if !c.is_alphanumeric() && c != '-' && c != '_' {
+                    return Err(format!(
+                        "Invalid character in Batch ID: '{}'. Allowed: alphanumeric, '-', '_'",
+                        c
+                    ));
+                }
+            }
+            Ok(Self(id_str))
+        }
+    }
+
+    impl AsRef<str> for BatchId {
+        fn as_ref(&self) -> &str {
+            &self.0
+        }
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use crate::reader::concurrent_lines;
+    use crate::test::{create_test_queue, localstack};
+
+    use super::*;
+
+    // -------------------------------------------------------------------------
+    // transform_input Unit Tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_transform_input_text_mode_with_string() {
+        let input = serde_json::json!("hello world");
+        let (id, body) = transform_input(&input, "text");
+
+        // ID should be a valid UUID
+        assert!(uuid::Uuid::parse_str(&id).is_ok());
+        // Body should be the raw string
+        assert_eq!(body, "hello world");
+    }
+
+    #[test]
+    fn test_transform_input_text_mode_with_object() {
+        let input = serde_json::json!({"key": "value"});
+        let (id, body) = transform_input(&input, "text");
+
+        // ID should be a valid UUID
+        assert!(uuid::Uuid::parse_str(&id).is_ok());
+        // Body should be JSON serialized
+        assert_eq!(body, r#"{"key":"value"}"#);
+    }
+
+    #[test]
+    fn test_transform_input_json_mode_with_id_and_body() {
+        let input = serde_json::json!({
+            "id": "my-custom-id-123",
+            "body": {"data": "payload"}
+        });
+        let (id, body) = transform_input(&input, "json");
+
+        // ID should use the provided id field
+        assert_eq!(id, "my-custom-id-123");
+        // Body should be the serialized body field
+        assert_eq!(body, r#"{"data":"payload"}"#);
+    }
+
+    #[test]
+    fn test_transform_input_json_mode_with_string_body() {
+        let input = serde_json::json!({
+            "id": "msg-456",
+            "body": "plain text body"
+        });
+        let (id, body) = transform_input(&input, "json");
+
+        assert_eq!(id, "msg-456");
+        // String body should be used as-is (not double-quoted)
+        assert_eq!(body, "plain text body");
+    }
+
+    #[test]
+    fn test_transform_input_json_mode_missing_id() {
+        let input = serde_json::json!({
+            "body": {"data": "test"}
+        });
+        let (id, body) = transform_input(&input, "json");
+
+        // Should generate a UUID when id is missing
+        assert!(uuid::Uuid::parse_str(&id).is_ok());
+        assert_eq!(body, r#"{"data":"test"}"#);
+    }
+
+    #[test]
+    fn test_transform_input_json_mode_missing_body() {
+        let input = serde_json::json!({
+            "id": "id-only"
+        });
+        let (id, body) = transform_input(&input, "json");
+
+        assert_eq!(id, "id-only");
+        // When body is missing, serialize the entire input
+        assert!(body.contains("id-only"));
+    }
+
+    #[test]
+    fn test_transform_input_json_mode_not_object() {
+        // When input is not an object in JSON mode, fall back to text behavior
+        let input = serde_json::json!("just a string");
+        let (id, body) = transform_input(&input, "json");
+
+        assert!(uuid::Uuid::parse_str(&id).is_ok());
+        assert_eq!(body, r#""just a string""#);
+    }
+
+    #[test]
+    fn test_transform_input_default_mode_is_text() {
+        let input = serde_json::json!("test message");
+        let (id1, body1) = transform_input(&input, "text");
+        let (id2, body2) = transform_input(&input, "unknown_mode");
+
+        // Both should behave the same (text mode)
+        assert!(uuid::Uuid::parse_str(&id1).is_ok());
+        assert!(uuid::Uuid::parse_str(&id2).is_ok());
+        assert_eq!(body1, "test message");
+        assert_eq!(body2, "test message");
+    }
+
+    // -------------------------------------------------------------------------
+    // BatchId Validation Unit Tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_batch_id_valid() {
+        assert!(super::validation::BatchId::new("valid-id_123").is_ok());
+        assert!(super::validation::BatchId::new("a").is_ok());
+        assert!(super::validation::BatchId::new("ABC-xyz_789").is_ok());
+    }
+
+    #[test]
+    fn test_batch_id_empty() {
+        let result = super::validation::BatchId::new("");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("empty"));
+    }
+
+    #[test]
+    fn test_batch_id_too_long() {
+        let long_id = "a".repeat(81);
+        let result = super::validation::BatchId::new(long_id);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("maximum length"));
+    }
+
+    #[test]
+    fn test_batch_id_invalid_characters() {
+        let result = super::validation::BatchId::new("invalid@id");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Invalid character"));
+
+        let result = super::validation::BatchId::new("has space");
+        assert!(result.is_err());
+
+        let result = super::validation::BatchId::new("has.dot");
+        assert!(result.is_err());
+    }
+
+    // -------------------------------------------------------------------------
+    // SqsBatch Integration Tests (require LocalStack)
+    // -------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_local() {
+        // create a localstack container and a queue
+        let (endpoint, container) = localstack().await.unwrap();
+        let queue_url = create_test_queue(&container, "batch-send-test", false)
+            .await
+            .unwrap();
+
+        // create a reader for the batch messages
+        let reader = tokio::io::BufReader::new(std::io::Cursor::new(
+            b"first line\nsecond line\nthird\n".to_vec(),
+        ));
+        let (handle, rx) = concurrent_lines(reader, 10);
+
+        // create a sqs batch client and send the batch messages to the queue
+        let sqs = SqsBatch::local(&queue_url, Some(endpoint)).await;
+        sqs.send(rx).await;
+
+        // wait for the handle to complete to ensure the messages are sent
+        handle.await.unwrap();
+
+        // create a sqs client and receive the messages from the queue
+        let client = aws_sdk_sqs::Client::new(&sqs.aws_config);
+        let receive_output = client
+            .receive_message()
+            .queue_url(&queue_url)
+            .max_number_of_messages(10)
+            .send()
+            .await
+            .unwrap();
+
+        // verify the messages were received without respect to the order
+        let messages = receive_output.messages.unwrap_or_default();
+        assert_eq!(messages.len(), 3);
+
+        let received_bodies = messages
+            .iter()
+            .filter_map(|m| m.body())
+            .collect::<Vec<&str>>();
+
+        assert_eq!(received_bodies.len(), 3);
+        assert!(received_bodies.contains(&"first line"));
+        assert!(received_bodies.contains(&"second line"));
+        assert!(received_bodies.contains(&"third"));
+
+        container.stop().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_verify_queue_exists_valid_queue() {
+        let (endpoint, container) = localstack().await.unwrap();
+        let queue_url = create_test_queue(&container, "exists-test", false)
+            .await
+            .unwrap();
+
+        let sqs = SqsBatch::local(&queue_url, Some(endpoint)).await;
+        let client = aws_sdk_sqs::Client::new(&sqs.aws_config);
+
+        // Should succeed for an existing queue
+        let result = verify_queue_exists(&client, &queue_url).await;
+        assert!(result.is_ok());
+
+        container.stop().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_verify_queue_exists_invalid_queue() {
+        let (endpoint, container) = localstack().await.unwrap();
+
+        // Create a valid queue first (so we have available queues to list)
+        let _queue_url = create_test_queue(&container, "valid-queue", false)
+            .await
+            .unwrap();
+
+        let sqs = SqsBatch::local("http://fake-queue-url/nonexistent", Some(endpoint)).await;
+        let client = aws_sdk_sqs::Client::new(&sqs.aws_config);
+
+        // Should fail with helpful error message
+        let result =
+            verify_queue_exists(&client, "http://fake-queue-url/000000000000/nonexistent").await;
+        assert!(result.is_err());
+
+        let error_msg = result.unwrap_err().to_string();
+        // Should mention the queue was not found
+        assert!(
+            error_msg.contains("not found")
+                || error_msg.contains("Queue")
+                || error_msg.contains("verify")
+        );
+
+        container.stop().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_batch_send_multiple_batches() {
+        // Test that messages are correctly batched (10 per batch)
+        let (endpoint, container) = localstack().await.unwrap();
+        let queue_url = create_test_queue(&container, "multi-batch-test", false)
+            .await
+            .unwrap();
+
+        // Create 25 messages (should be 3 batches: 10 + 10 + 5)
+        let messages: Vec<String> = (0..25).map(|i| format!("message-{}", i)).collect();
+        let input = messages.join("\n") + "\n";
+
+        let reader = tokio::io::BufReader::new(std::io::Cursor::new(input.into_bytes()));
+        let (handle, rx) = concurrent_lines(reader, 100);
+
+        let sqs = SqsBatch::local(&queue_url, Some(endpoint)).await;
+        sqs.send(rx).await;
+        handle.await.unwrap();
+
+        // Receive all messages (may need multiple receives)
+        let client = aws_sdk_sqs::Client::new(&sqs.aws_config);
+        let mut all_messages = Vec::new();
+
+        for _ in 0..5 {
+            // Try multiple times to get all messages
+            let output = client
+                .receive_message()
+                .queue_url(&queue_url)
+                .max_number_of_messages(10)
+                .send()
+                .await
+                .unwrap();
+
+            if let Some(msgs) = output.messages {
+                all_messages.extend(msgs);
+            }
+
+            if all_messages.len() >= 25 {
+                break;
+            }
+        }
+
+        assert_eq!(all_messages.len(), 25);
+
+        container.stop().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_empty_messages_filtered() {
+        let (endpoint, container) = localstack().await.unwrap();
+        let queue_url = create_test_queue(&container, "empty-filter-test", false)
+            .await
+            .unwrap();
+
+        // Input with empty lines that should be filtered
+        let input = b"valid1\n\n\nvalid2\n\n".to_vec();
+        let reader = tokio::io::BufReader::new(std::io::Cursor::new(input));
+        let (handle, rx) = concurrent_lines(reader, 10);
+
+        let sqs = SqsBatch::local(&queue_url, Some(endpoint)).await;
+        sqs.send(rx).await;
+        handle.await.unwrap();
+
+        let client = aws_sdk_sqs::Client::new(&sqs.aws_config);
+        let output = client
+            .receive_message()
+            .queue_url(&queue_url)
+            .max_number_of_messages(10)
+            .send()
+            .await
+            .unwrap();
+
+        let messages = output.messages.unwrap_or_default();
+        // Only 2 valid messages should be sent
+        assert_eq!(messages.len(), 2);
+
+        let bodies: Vec<&str> = messages.iter().filter_map(|m| m.body()).collect();
+        assert!(bodies.contains(&"valid1"));
+        assert!(bodies.contains(&"valid2"));
+
+        container.stop().await.unwrap();
+    }
+}

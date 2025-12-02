@@ -1,0 +1,4 @@
+# https://doc.rust-lang.org/nightly/cargo/reference/config.html
+
+[alias]
+tidy = ["clippy", "--", "-D", "warnings"]

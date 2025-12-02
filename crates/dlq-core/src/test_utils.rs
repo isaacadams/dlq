@@ -60,12 +60,11 @@ impl TestEnv {
         create_sqs_queue(&self.container, &prefix, self.debug).await
     }
 
-    /// Create a DeadLetterQueue instance for a specific queue
-    pub async fn dlq_for_queue(&self, queue_name: &str) -> crate::sqs::DeadLetterQueue {
+    /// Create a DeadLetterQueue instance
+    pub fn dlq(&self) -> crate::sqs::DeadLetterQueue {
         crate::sqs::DeadLetterQueue {
             config: self.config.clone(),
             client: self.client.clone(),
-            default_queue_url: Some(self.queue_url(queue_name)),
         }
     }
 
@@ -170,11 +169,7 @@ pub async fn setup_dlq_with_queue(
     .await
     .expect("Timeout waiting for queue to be available");
 
-    let dlq = crate::sqs::DeadLetterQueue {
-        config,
-        client,
-        default_queue_url: Some(queue_url.clone()),
-    };
+    let dlq = crate::sqs::DeadLetterQueue { config, client };
 
     (dlq, queue_url)
 }
