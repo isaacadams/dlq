@@ -1,3 +1,11 @@
+//! Batch message sending functionality for the CLI.
+//!
+//! This module provides both interactive and batch sending capabilities:
+//!
+//! - **Interactive mode**: Reads lines from stdin and sends them to SQS
+//! - **Batch mode**: Processes job items from SQLite and sends to SQS with
+//!   concurrency, progress tracking, and retry support
+
 use crate::database::Database;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use serde_json::Value;
@@ -5,15 +13,18 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-pub async fn run(aws_config: aws_config::SdkConfig) {
+/// Runs the interactive send mode.
+///
+/// Reads lines from stdin and sends them to SQS using the pipeline.
+///
+/// # Arguments
+///
+/// * `aws_config` - AWS SDK configuration
+/// * `queue_url` - The URL of the SQS queue to send messages to
+pub async fn run(aws_config: aws_config::SdkConfig, queue_url: &str) {
     let (h_stdin, rx_stdin) = crate::reader::concurrent_lines(tokio::io::stdin(), 100);
 
-    // Default queue URL for interactive send mode
-    let queue_url = std::env::var("DLQ_URL").unwrap_or_else(|_| {
-        "http://sqs.us-east-1.localhost.localstack.cloud:4566/000000000000/demo".to_string()
-    });
-
-    SqsBatch::from_config(aws_config, &queue_url)
+    SqsBatch::from_config(aws_config, queue_url)
         .send(rx_stdin)
         .await;
 
@@ -22,25 +33,49 @@ pub async fn run(aws_config: aws_config::SdkConfig) {
     }
 }
 
-/// Represents a job item with its database ID for tracking results
+/// Represents a job item with its database ID for tracking results.
+///
+/// Used internally to associate SQS send results back to database records.
 #[derive(Debug, Clone)]
 struct JobItem {
+    /// Database ID for this item (from job_items table)
     db_id: i64,
+    /// The message content to send
     input: Value,
 }
 
-/// Result of sending an item to SQS
+/// Result of sending an item to SQS.
+///
+/// Captures the outcome of a send operation for database recording.
 #[derive(Debug, Clone)]
 struct SendResult {
+    /// Database ID of the original item
     db_id: i64,
+    /// Whether the send was successful
     success: bool,
+    /// SQS response data (message ID, MD5, etc.) or error details
     output: Option<Value>,
+    /// Error message if the send failed
     error: Option<String>,
+    /// Batch ID this item was sent in (for debugging/correlation)
     #[allow(dead_code)]
     batch_id: String,
 }
 
-/// Verify that the given queue URL exists, or return a helpful error with available queues
+/// Verifies that the given queue URL exists, or returns a helpful error with available queues.
+///
+/// Attempts to get queue attributes to confirm the queue exists. If the queue doesn't exist,
+/// lists available queues and returns an error message with suggestions for the user.
+///
+/// # Arguments
+///
+/// * `client` - The SQS client to use
+/// * `queue_url` - The queue URL to verify
+///
+/// # Returns
+///
+/// * `Ok(())` - The queue exists
+/// * `Err(anyhow::Error)` - The queue doesn't exist or another error occurred
 async fn verify_queue_exists(client: &aws_sdk_sqs::Client, queue_url: &str) -> anyhow::Result<()> {
     // Try to get queue attributes to verify it exists
     match client
@@ -107,7 +142,33 @@ async fn verify_queue_exists(client: &aws_sdk_sqs::Client, queue_url: &str) -> a
     }
 }
 
-/// Run batch send from database with streaming architecture
+/// Runs batch send from database with streaming architecture.
+///
+/// Implements a high-throughput pipeline for sending job items to SQS:
+///
+/// 1. **Loader Task**: Stages pending items from SQLite in batches
+/// 2. **Sender Workers**: Concurrently send batches to SQS
+/// 3. **Writer Task**: Records results back to SQLite
+///
+/// Uses channels to decouple stages for maximum throughput while maintaining
+/// back-pressure to avoid memory issues.
+///
+/// # Arguments
+///
+/// * `aws_config` - AWS SDK configuration
+/// * `job_id` - ID of the job to process (must have name='send_batch')
+/// * `queue_url` - SQS queue URL to send messages to
+/// * `batch_size` - Messages per SQS batch (max 10)
+/// * `stage_size` - Items to stage from SQLite per round (auto-optimized if None)
+/// * `concurrency` - Number of parallel sender workers
+/// * `_retry_limit` - Max retries per item (currently unused)
+/// * `limit` - Maximum items to process (all if None)
+/// * `dry_run` - If true, preview without sending
+///
+/// # Returns
+///
+/// * `Ok(())` - Job completed successfully
+/// * `Err(anyhow::Error)` - An error occurred
 #[allow(clippy::too_many_arguments)]
 pub async fn run_batch(
     aws_config: aws_config::SdkConfig,
@@ -728,8 +789,16 @@ fn transform_input(input: &Value, input_type: &str) -> (String, String) {
     }
 }
 
+/// Client for sending messages to SQS in batches via a streaming pipeline.
+///
+/// Uses the `pumps` library to create an efficient pipeline that:
+/// - Filters empty messages
+/// - Batches messages (10 per batch, the SQS maximum)
+/// - Sends batches concurrently
 pub struct SqsBatch {
+    /// AWS SDK configuration
     pub aws_config: aws_config::SdkConfig,
+    /// Target SQS queue URL
     pub aws_sqs_queue_url: String,
 }
 
@@ -772,6 +841,14 @@ impl SqsBatch {
         }
     }
 
+    /// Sends messages from a channel receiver to SQS.
+    ///
+    /// Consumes strings from the receiver, batches them, and sends to SQS
+    /// with concurrent processing. Empty strings are filtered out.
+    ///
+    /// # Arguments
+    ///
+    /// * `rx` - Channel receiver providing message strings
     pub async fn send(&self, rx: tokio::sync::mpsc::Receiver<String>) {
         let client = std::sync::Arc::new(aws_sdk_sqs::Client::new(&self.aws_config));
         let aws_sqs_queue_url = std::sync::Arc::new(self.aws_sqs_queue_url.clone());
@@ -823,6 +900,15 @@ impl SqsBatch {
     }
 }
 
+/// Sends a batch of message entries to SQS.
+///
+/// Logs the response on success or the error on failure.
+///
+/// # Arguments
+///
+/// * `client` - The SQS client
+/// * `queue_url` - Target queue URL
+/// * `entries` - Message entries to send (max 10)
 async fn job(
     client: &aws_sdk_sqs::Client,
     queue_url: &str,
@@ -851,14 +937,31 @@ async fn job(
     }
 }
 
+/// Validation utilities for SQS message IDs.
 #[allow(dead_code)]
 mod validation {
     use std::convert::Into;
 
+    /// A validated SQS batch message ID.
+    ///
+    /// SQS batch entry IDs must be:
+    /// - Non-empty
+    /// - At most 80 characters
+    /// - Only contain alphanumeric characters, hyphens (-), and underscores (_)
     #[derive(Debug, Clone)]
     pub struct BatchId(String);
 
     impl BatchId {
+        /// Creates a new BatchId after validating the input.
+        ///
+        /// # Arguments
+        ///
+        /// * `id` - The ID string to validate
+        ///
+        /// # Returns
+        ///
+        /// * `Ok(BatchId)` - The ID is valid
+        /// * `Err(String)` - Validation error message
         pub fn new<S: Into<String>>(id: S) -> Result<Self, String> {
             let id_str = id.into();
             if id_str.is_empty() {

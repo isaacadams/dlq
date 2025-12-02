@@ -1,3 +1,28 @@
+//! # DLQ CLI
+//!
+//! A command-line interface for working with AWS SQS dead letter queues.
+//!
+//! ## Features
+//!
+//! - **List Queues**: View all SQS queues in your AWS account
+//! - **Poll Messages**: Receive and display messages from queues as JSON
+//! - **Batch Sending**: High-throughput batch message sending with job tracking
+//! - **Job Management**: SQLite-backed job queue for reliable processing
+//! - **LocalStack Support**: First-class local development support
+//!
+//! ## Usage
+//!
+//! ```bash
+//! # List all queues
+//! dlq list
+//!
+//! # Poll messages from a queue
+//! dlq poll https://sqs.us-east-1.amazonaws.com/123456789/my-dlq
+//!
+//! # Use LocalStack for local development
+//! dlq --local list
+//! ```
+
 use aws_config::SdkConfig;
 use clap::{Parser, Subcommand};
 use dlq::DeadLetterQueue;
@@ -16,6 +41,10 @@ pub async fn main() {
     }
 }
 
+/// AWS Dead Letter Queue CLI client.
+///
+/// A command-line tool for interacting with AWS SQS queues, with special focus
+/// on dead letter queue operations like polling messages and batch processing.
 #[derive(Debug, Parser)]
 #[command(name = "dlq")]
 #[command(about = "aws dead letter queue CLI client written in rust", long_about = None)]
@@ -32,10 +61,39 @@ pub struct Cli {
     command: Commands,
 }
 
-/// Load AWS SDK configuration based on CLI flags.
-/// - If `local` is true: uses test credentials ("test"/"test") and localhost:4566 endpoint
-/// - If `endpoint` is provided, it overrides the default endpoint
-/// - Otherwise: loads credentials from the standard AWS environment/config chain
+/// Loads AWS SDK configuration based on CLI flags.
+///
+/// This function configures the AWS SDK based on the provided flags:
+///
+/// - If `local` is true: Uses test credentials ("test"/"test") and localhost:4566 endpoint
+///   for LocalStack compatibility
+/// - If `endpoint` is provided: Uses that endpoint URL (overrides local default)
+/// - Otherwise: Loads credentials from the standard AWS environment/config chain
+///
+/// # Arguments
+///
+/// * `local` - Whether to use local development mode (LocalStack)
+/// * `endpoint` - Optional custom endpoint URL
+///
+/// # Returns
+///
+/// A configured `SdkConfig` ready for use with AWS SDK clients.
+///
+/// # Example
+///
+/// ```no_run
+/// # async fn example() {
+/// // Production mode - uses standard AWS credentials
+/// let config = load_aws_config(false, None).await;
+///
+/// // LocalStack mode
+/// let config = load_aws_config(true, None).await;
+///
+/// // Custom endpoint
+/// let config = load_aws_config(false, Some("http://custom-endpoint:4566")).await;
+/// # }
+/// # use dlq_cli::load_aws_config;
+/// ```
 pub async fn load_aws_config(local: bool, endpoint: Option<&str>) -> SdkConfig {
     let mut loader = aws_config::from_env().region(
         aws_config::meta::region::RegionProviderChain::default_provider()
@@ -65,17 +123,32 @@ pub async fn load_aws_config(local: bool, endpoint: Option<&str>) -> SdkConfig {
     loader.load().await
 }
 
+/// Available CLI commands.
 #[derive(Debug, Subcommand)]
 enum Commands {
+    /// Display current AWS configuration (endpoint, region, credentials)
     Info,
+
+    /// List all SQS queue URLs in the AWS account
     List,
+
+    /// Poll and display messages from a queue as JSON
     Poll {
-        /// the url of your dead letter queue
-        /// ( can optionally be set via environment variable DLQ_URL=... )
-        url: Option<String>,
+        /// The URL of your dead letter queue.
+        url: String,
     },
-    Send,
-    /// Send job items to an SQS queue in batches
+
+    /// Interactive message sending mode (reads from stdin)
+    Send {
+        /// The URL of your SQS queue to send messages to.
+        url: String,
+    },
+
+    /// Send job items to an SQS queue in batches.
+    ///
+    /// Reads items from a job in the SQLite database and sends them to SQS
+    /// using efficient batch operations. Supports concurrency, retries,
+    /// and progress tracking.
     SendBatch {
         /// Job ID to process (must have name = 'send_batch')
         job_id: i64,
@@ -107,10 +180,14 @@ enum Commands {
         #[arg(long)]
         dry_run: bool,
     },
+
+    /// Job management commands
     Job {
         #[command(subcommand)]
         command: database::JobCommands,
     },
+
+    /// Database utility commands
     Database {
         #[command(subcommand)]
         command: database::DatabaseCommands,
@@ -118,10 +195,19 @@ enum Commands {
 }
 
 impl Cli {
+    /// Executes the CLI command.
+    ///
+    /// Loads AWS configuration based on global flags, then dispatches to the
+    /// appropriate command handler.
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(())` - Command completed successfully
+    /// * `Err(anyhow::Error)` - An error occurred during execution
     pub async fn run(self) -> anyhow::Result<()> {
         // Load AWS config once, based on global flags
         let aws_config = load_aws_config(self.local, self.endpoint.as_deref()).await;
-        let dlq = DeadLetterQueue::from_config(aws_config.clone(), None);
+        let dlq = DeadLetterQueue::from_config(aws_config.clone());
 
         match self.command {
             Commands::Info => {
@@ -156,9 +242,9 @@ impl Cli {
                 }
             }
             Commands::Poll { url } => {
-                dlq.poll(url.as_deref()).await;
+                dlq.poll(&url).await;
             }
-            Commands::Send => send::run(aws_config).await,
+            Commands::Send { url } => send::run(aws_config, &url).await,
             Commands::SendBatch {
                 job_id,
                 queue_url,

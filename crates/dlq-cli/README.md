@@ -34,11 +34,7 @@ AWS_PROFILE=production AWS_REGION=us-east-1 dlq list
 Receive and display messages from a queue as JSON.
 
 ```bash
-# With explicit URL
 dlq poll https://sqs.us-east-1.amazonaws.com/123456789/my-dlq
-
-# With environment variable
-DLQ_URL=https://sqs.us-east-1.amazonaws.com/123456789/my-dlq dlq poll
 ```
 
 ### Show AWS Info
@@ -51,10 +47,10 @@ dlq info
 
 ### Send Messages (Interactive)
 
-Interactive mode for sending messages to a queue.
+Interactive mode for sending messages to a queue. Reads lines from stdin and sends them to SQS.
 
 ```bash
-dlq send
+dlq send https://sqs.us-east-1.amazonaws.com/123456789/my-queue
 ```
 
 ### Batch Send
@@ -173,4 +169,3 @@ dlq --local send-batch 1 http://sqs.us-east-1.localhost.localstack.cloud:4566/00
 | `AWS_REGION` | AWS region |
 | `AWS_ACCESS_KEY_ID` | AWS access key |
 | `AWS_SECRET_ACCESS_KEY` | AWS secret key |
-| `DLQ_URL` | Default queue URL for `poll` command |

@@ -45,9 +45,6 @@ dlq list
 # Poll messages from a queue
 dlq poll https://sqs.us-east-1.amazonaws.com/123456789/my-queue
 
-# Or set the queue URL via environment variable
-DLQ_URL=https://sqs.us-east-1.amazonaws.com/123456789/my-queue dlq poll
-
 # Override AWS profile/region
 AWS_PROFILE=production AWS_REGION=eu-west-1 dlq list
 ```

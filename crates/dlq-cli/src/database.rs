@@ -1,3 +1,13 @@
+//! SQLite database layer for job management.
+//!
+//! Provides persistent storage for batch processing jobs, including:
+//!
+//! - **Jobs**: Named processing jobs with configuration
+//! - **Job Items**: Individual items within a job (pending, processing, done, failed)
+//! - **Retry History**: Tracking of retry attempts for failed items
+//!
+//! Uses SQLite with WAL mode for improved concurrency.
+
 use std::path::Path;
 
 use indicatif::{ProgressBar, ProgressStyle};
@@ -9,6 +19,7 @@ use sqlx::{
 };
 use tokio::sync::OnceCell;
 
+/// CLI subcommands for job management.
 #[derive(Debug, clap::Subcommand)]
 pub enum JobCommands {
     /// List all jobs
@@ -74,18 +85,23 @@ impl JobCommands {
     }
 }
 
+/// CLI subcommands for database utilities.
 #[derive(Debug, clap::Subcommand)]
 pub enum DatabaseCommands {
+    /// Seed the database with test data for development/testing
     Seed {
         /// Job name
         name: String,
 
+        /// Number of items to generate
         #[arg(long)]
         items: usize,
 
+        /// Show progress bar during seeding
         #[arg(short, long, action)]
         progress: bool,
     },
+    /// Delete all database files (sqs.db, sqs.db-wal, sqs.db-shm)
     Clean,
 }
 
@@ -127,47 +143,85 @@ impl Default for JobConfiguration {
     }
 }
 
+/// A job record from the database.
+///
+/// Represents a named processing job that contains multiple items.
 #[derive(Debug, sqlx::FromRow)]
 pub struct JobModel {
+    /// Unique job ID
     pub id: i64,
+    /// Human-readable job name
     pub name: String,
+    /// Job configuration (input type, etc.)
     pub configuration: Json<JobConfiguration>,
+    /// When the job was created
     pub timestamp_start: sqlx::types::chrono::DateTime<sqlx::types::chrono::Utc>,
+    /// When the job completed (None if still running)
     pub timestamp_end: Option<sqlx::types::chrono::DateTime<sqlx::types::chrono::Utc>>,
 }
 
+/// An individual item within a job.
+///
+/// Items progress through states: pending → processing → done/failed
 #[derive(Debug, sqlx::FromRow)]
 pub struct JobItemModel {
+    /// Unique item ID
     pub id: i64,
+    /// Parent job ID
     pub job_id: i64,
+    /// Input data for this item
     pub input: Value,
+    /// Output data after processing (SQS response, etc.)
     pub output: Option<Value>,
+    /// Error message if the item failed
     pub error: Option<String>,
 }
 
+/// A retry attempt record for tracking failed sends.
 #[derive(Debug, sqlx::FromRow)]
 pub struct RetryHistoryModel {
+    /// Unique retry record ID
     pub id: i64,
+    /// The item that was retried
     pub item_id: i64,
+    /// Which attempt this was (1, 2, 3, ...)
     pub attempt_number: i32,
+    /// Error that triggered the retry
     pub error: Option<String>,
+    /// Raw SQS response data
     pub sqs_response: Option<Json<Value>>,
+    /// Batch ID the item was sent in
     pub batch_id: Option<String>,
+    /// Snapshot of input at time of retry
     pub input_snapshot: Option<Json<Value>>,
+    /// When this retry occurred
     pub timestamp: sqlx::types::chrono::DateTime<sqlx::types::chrono::Utc>,
 }
 
-/// Batch completion result for efficient bulk updates
+/// Result of completing a batch of items.
+///
+/// Used for efficient bulk updates after sending messages.
 #[derive(Debug)]
 pub struct CompletionResult {
+    /// Database ID of the item
     pub id: i64,
+    /// Output data to store
     pub output: Option<Value>,
+    /// Error message (if failed)
     pub error: Option<String>,
+    /// Whether the send was successful
     pub success: bool,
 }
 
+/// Global database connection pool (singleton).
 static POOL: OnceCell<SqlitePool> = OnceCell::const_new();
 
+/// Gets or initializes the global SQLite connection pool.
+///
+/// Creates the database file (`sqs.db`) if it doesn't exist and sets up
+/// the schema (jobs, job_items, retry_history tables).
+///
+/// Uses WAL mode for better read/write concurrency.
 async fn pool() -> &'static SqlitePool {
     POOL.get_or_init(|| async {
         let pool = SqlitePoolOptions::new()
