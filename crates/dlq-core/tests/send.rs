@@ -3,6 +3,8 @@ mod common;
 use common::create_or_get_queue_url;
 use proptest::prelude::*;
 use std::collections::HashSet;
+
+use crate::common::local_aws_config;
 // Property-based test: Send-receive symmetry
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(10))]
@@ -16,7 +18,7 @@ proptest! {
     ) {
         tokio::runtime::Runtime::new().unwrap().block_on(async {
             let queue = create_or_get_queue_url("test-prop-roundtrip");
-            let dlq = dlq::DeadLetterQueue::new(Some(aws_sdk_sqs::config::Credentials::new("test", "test", None, None, "static")), Some("http://localhost:4566"), Some(&queue)).await;
+            let dlq = dlq::DeadLetterQueue::from_config(local_aws_config().await, Some(&queue));
 
             // Send the batch
             let result = dlq.send_batch(&messages).await;
@@ -70,7 +72,7 @@ proptest! {
     ) {
         tokio::runtime::Runtime::new().unwrap().block_on(async {
             let queue = create_or_get_queue_url("test-prop-unicode");
-            let dlq = dlq::DeadLetterQueue::new(Some(aws_sdk_sqs::config::Credentials::new("test", "test", None, None, "static")), Some("http://localhost:4566"), Some(&queue)).await;
+            let dlq = dlq::DeadLetterQueue::from_config(local_aws_config().await, Some(&queue));
 
             let result = dlq.send_batch(&messages).await;
             prop_assert!(result.is_ok(), "send_batch should handle unicode content");
@@ -117,7 +119,7 @@ proptest! {
     ) {
         tokio::runtime::Runtime::new().unwrap().block_on(async {
             let queue = create_or_get_queue_url("test-prop-sizes");
-            let dlq = dlq::DeadLetterQueue::new(Some(aws_sdk_sqs::config::Credentials::new("test", "test", None, None, "static")), Some("http://localhost:4566"), Some(&queue)).await;
+            let dlq = dlq::DeadLetterQueue::from_config(local_aws_config().await, Some(&queue));
 
             // Generate messages with unique suffixes
             let messages: Vec<String> = (0..batch_size)
@@ -160,7 +162,7 @@ proptest! {
     ) {
         tokio::runtime::Runtime::new().unwrap().block_on(async {
             let queue = create_or_get_queue_url("test-prop-special");
-            let dlq = dlq::DeadLetterQueue::new(Some(aws_sdk_sqs::config::Credentials::new("test", "test", None, None, "static")), Some("http://localhost:4566"), Some(&queue)).await;
+            let dlq = dlq::DeadLetterQueue::from_config(local_aws_config().await, Some(&queue));
 
             let result = dlq.send_batch(&messages).await;
             prop_assert!(result.is_ok(), "send_batch should handle special characters");
