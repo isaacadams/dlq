@@ -98,6 +98,14 @@ enum Commands {
         /// Max retries per item (default: 0 = disabled)
         #[arg(long, default_value = "0")]
         retry_limit: u32,
+
+        /// Maximum number of items to process (processes all if omitted)
+        #[arg(long, short = 'n')]
+        limit: Option<i64>,
+
+        /// Preview what would be sent without actually sending to SQS
+        #[arg(long)]
+        dry_run: bool,
     },
     Job {
         #[command(subcommand)]
@@ -158,6 +166,8 @@ impl Cli {
                 stage_size,
                 concurrency,
                 retry_limit,
+                limit,
+                dry_run,
             } => {
                 send::run_batch(
                     aws_config,
@@ -167,6 +177,8 @@ impl Cli {
                     stage_size,
                     concurrency,
                     retry_limit,
+                    limit,
+                    dry_run,
                 )
                 .await?;
             }

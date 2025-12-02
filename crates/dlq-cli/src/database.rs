@@ -500,6 +500,38 @@ impl Database {
         Ok(row.get("count"))
     }
 
+    /// Peeks at pending items without changing their status (for dry-run mode).
+    pub async fn peek_pending_items(
+        &self,
+        job_id: i64,
+        limit: i64,
+    ) -> Result<Vec<(i64, Value)>, sqlx::Error> {
+        let rows = sqlx::query(
+            r#"
+            SELECT id, input
+            FROM job_items
+            WHERE job_id = $1 AND status = 'pending'
+            ORDER BY id
+            LIMIT $2
+            "#,
+        )
+        .bind(job_id)
+        .bind(limit)
+        .fetch_all(self.pool())
+        .await?;
+
+        let results: Vec<(i64, Value)> = rows
+            .into_iter()
+            .map(|row| {
+                let id: i64 = row.get("id");
+                let input: Value = row.get("input");
+                (id, input)
+            })
+            .collect();
+
+        Ok(results)
+    }
+
     /// Atomically stages a batch of pending items (sets to 'processing') and returns (id, input) pairs.
     /// Uses a transaction to select-then-update atomically. Filters by job_id if provided.
     pub async fn stage_pending_items(

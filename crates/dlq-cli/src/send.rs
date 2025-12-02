@@ -116,6 +116,8 @@ pub async fn run_batch(
     stage_size: Option<i64>,
     concurrency: usize,
     _retry_limit: u32,
+    limit: Option<i64>,
+    dry_run: bool,
 ) -> anyhow::Result<()> {
     let db = Arc::new(Database::new().await?);
 
@@ -133,12 +135,14 @@ pub async fn run_batch(
         ));
     }
 
-    // Create SQS client early to verify queue exists
+    // Create SQS client early to verify queue exists (skip in dry run)
     let sqs = SqsBatch::from_config(aws_config, queue_url);
     let client = Arc::new(aws_sdk_sqs::Client::new(&sqs.aws_config));
 
-    // Verify the queue exists before processing
-    verify_queue_exists(&client, queue_url).await?;
+    if !dry_run {
+        // Verify the queue exists before processing
+        verify_queue_exists(&client, queue_url).await?;
+    }
 
     let config = job.configuration.0;
     let input_type = Arc::new(config.input_type.clone());
@@ -150,18 +154,32 @@ pub async fn run_batch(
         return Ok(());
     }
 
+    // Apply limit if specified
+    let items_to_process = match limit {
+        Some(l) => total_pending.min(l),
+        None => total_pending,
+    };
+
     // Auto-optimize stage size if not provided
     let stage_size = stage_size.unwrap_or({
-        if total_pending < 1000 {
-            total_pending
+        if items_to_process < 1000 {
+            items_to_process
         } else {
             1000
         }
     });
 
+    if dry_run {
+        println!(
+            "[DRY RUN] Would process job {} ({} of {} pending items, stage_size={}, batch_size={}, concurrency={})\n",
+            job_id, items_to_process, total_pending, stage_size, batch_size, concurrency
+        );
+        return run_batch_dry_run(db, job_id, items_to_process, &input_type).await;
+    }
+
     println!(
         "Processing job {} ({} pending items, stage_size={}, batch_size={}, concurrency={})\n",
-        job_id, total_pending, stage_size, batch_size, concurrency
+        job_id, items_to_process, stage_size, batch_size, concurrency
     );
 
     // Setup multi-progress bars
@@ -173,7 +191,7 @@ pub async fn run_batch(
         .unwrap()
         .progress_chars("━━╸");
 
-    let load_pb = mp.add(ProgressBar::new(total_pending as u64));
+    let load_pb = mp.add(ProgressBar::new(items_to_process as u64));
     load_pb.set_style(load_style);
     load_pb.set_prefix("SQLite");
 
@@ -200,7 +218,7 @@ pub async fn run_batch(
         .unwrap()
         .progress_chars("━━╸");
 
-    let complete_pb = mp.add(ProgressBar::new(total_pending as u64));
+    let complete_pb = mp.add(ProgressBar::new(items_to_process as u64));
     complete_pb.set_style(complete_style);
     complete_pb.set_prefix("Total");
     complete_pb.enable_steady_tick(std::time::Duration::from_millis(100));
@@ -325,8 +343,15 @@ pub async fn run_batch(
     let loader_db_tx = db_tx.clone();
     let load_pb_clone = load_pb.clone();
     let items_loaded_clone = items_loaded.clone();
+    let items_limit = items_to_process as u64;
     let loader_handle = tokio::spawn(async move {
         'loader: loop {
+            // Check if we've reached the limit
+            let current_loaded = items_loaded_clone.load(Ordering::Relaxed);
+            if current_loaded >= items_limit {
+                break 'loader;
+            }
+
             // Request staging through the serialized db writer
             let (response_tx, response_rx) = tokio::sync::oneshot::channel();
             if loader_db_tx
@@ -358,6 +383,11 @@ pub async fn run_batch(
                 }
                 let loaded = items_loaded_clone.fetch_add(1, Ordering::Relaxed) + 1;
                 load_pb_clone.set_position(loaded);
+
+                // Stop if we've reached the limit
+                if loaded >= items_limit {
+                    break 'loader;
+                }
             }
         }
 
@@ -538,6 +568,46 @@ pub async fn run_batch(
         ),
     }
 
+    Ok(())
+}
+
+/// Run a dry-run of batch send - shows what would be sent without making changes
+async fn run_batch_dry_run(
+    db: Arc<Database>,
+    job_id: i64,
+    limit: i64,
+    input_type: &str,
+) -> anyhow::Result<()> {
+    // Fetch items without staging them (just peek at pending items)
+    let items = db.peek_pending_items(job_id, limit).await?;
+
+    if items.is_empty() {
+        println!("[DRY RUN] No pending items found");
+        return Ok(());
+    }
+
+    println!("[DRY RUN] Would send {} items:\n", items.len());
+
+    for (i, (db_id, input)) in items.iter().enumerate() {
+        let (message_id, message_body) = transform_input(input, input_type);
+
+        // Truncate body for display if too long
+        let display_body = if message_body.len() > 100 {
+            format!("{}...", &message_body[..100])
+        } else {
+            message_body
+        };
+
+        println!(
+            "  {}. [id={}] message_id={}\n     body: {}",
+            i + 1,
+            db_id,
+            message_id,
+            display_body
+        );
+    }
+
+    println!("\n[DRY RUN] No messages were sent. Remove --dry-run to send for real.");
     Ok(())
 }
 
