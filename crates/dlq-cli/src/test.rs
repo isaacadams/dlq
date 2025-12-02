@@ -87,9 +87,7 @@ async fn list_queues() {
 
     let mut cmd = Command::cargo_bin("dlq").unwrap();
 
-    cmd.args(["--endpoint", &endpoint]);
-    cmd.args(["--access-key-id", "test"]);
-    cmd.args(["--secret-access-key", "test"]);
+    cmd.args(["--local", "--endpoint", &endpoint]);
     cmd.arg("list");
     cmd.assert().success().stdout(predicate::str::contains(
         "http://sqs.us-east-1.localhost.localstack.cloud:4566/000000000000/test-queue",
@@ -114,9 +112,7 @@ async fn poll_queue() {
 
     let mut cmd = Command::cargo_bin("dlq").unwrap();
 
-    cmd.args(["--endpoint", &endpoint]);
-    cmd.args(["--access-key-id", "test"]);
-    cmd.args(["--secret-access-key", "test"]);
+    cmd.args(["--local", "--endpoint", &endpoint]);
     cmd.arg("poll");
     cmd.arg(&queue_url);
 
