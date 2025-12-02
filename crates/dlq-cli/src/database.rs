@@ -897,10 +897,12 @@ impl Database {
         let mut batch: Vec<Value> = Vec::with_capacity(1000);
 
         for line in reader.lines() {
-            let line = line?
+            let line = line?;
+
+            if line
                 .trim_matches(|c: char| c == '"' || c == '\'' || c == ' ' || c == '\n' || c == '\r')
-                .to_string();
-            if line.is_empty() {
+                .is_empty()
+            {
                 continue;
             }
 
