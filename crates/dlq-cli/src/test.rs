@@ -41,18 +41,18 @@ pub async fn create_test_queue<I: Image>(
 
     let mut result = container.exec(create_queue_command).await?;
 
+    // Capture output first - streams can only be read once
+    let output = result.stdout_to_vec().await?;
+
     if debug {
-        let mut stdout = String::new();
         let mut stderr = String::new();
-        result.stdout().read_to_string(&mut stdout).await.unwrap();
         result.stderr().read_to_string(&mut stderr).await.unwrap();
         println!(
             "Queue creation command output:\nstdout: {}\nstderr: {}",
-            stdout, stderr
+            String::from_utf8_lossy(&output),
+            stderr
         );
     }
-
-    let output = result.stdout_to_vec().await?;
 
     let json: serde_json::Value =
         serde_json::from_slice(&output).map_err(|e| TestcontainersError::Other(Box::new(e)))?;
