@@ -1,0 +1,8 @@
+# Keep rust-analyzer / flycheck on the release profile so it does not
+# populate a multi-GB target/debug tree alongside release builds.
+
+[cargo]
+extraArgs = ["--release"]
+
+[check]
+extraArgs = ["--release"]

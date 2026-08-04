@@ -28,9 +28,12 @@ aws --endpoint-url=http://localhost:4566 sqs create-queue --queue-name demo
 ### 3. Verify the Queue
 
 ```bash
-# List queues using the CLI
-cargo run -- --local list
+# List queues using the CLI (release builds keep target/ smaller on disk)
+cargo run --release -- --local list
 ```
+
+This workspace prefers **release** builds. Prefer `cargo build --release` /
+`cargo run --release`, or the aliases `cargo b` / `cargo r`.
 
 ## Example Workflows
 
@@ -38,20 +41,20 @@ cargo run -- --local list
 
 ```bash
 # Seed the database with test items
-cargo run -- database seed send_batch --items 10000 -p
+cargo run --release -- database seed send_batch --items 10000 -p
 
 # Send items to the queue
-cargo run -- --local send-batch 1 "http://sqs.us-east-1.localhost.localstack.cloud:4566/000000000000/demo"
+cargo run --release -- --local send-batch 1 "http://sqs.us-east-1.localhost.localstack.cloud:4566/000000000000/demo"
 
 # Check job status
-cargo run -- job status 1
+cargo run --release -- job status 1
 ```
 
 ### Polling Messages
 
 ```bash
 # Poll messages from the queue
-cargo run -- --local poll "http://sqs.us-east-1.localhost.localstack.cloud:4566/000000000000/demo"
+cargo run --release -- --local poll "http://sqs.us-east-1.localhost.localstack.cloud:4566/000000000000/demo"
 ```
 
 ### Loading Custom Data
@@ -62,17 +65,17 @@ echo '{"id": 1, "message": "hello"}' > items.jsonl
 echo '{"id": 2, "message": "world"}' >> items.jsonl
 
 # Load into a job
-cargo run -- job load --name my-job items.jsonl
+cargo run --release -- job load --name my-job items.jsonl
 
 # Send to queue
-cargo run -- --local send-batch 1 "http://sqs.us-east-1.localhost.localstack.cloud:4566/000000000000/demo"
+cargo run --release -- --local send-batch 1 "http://sqs.us-east-1.localhost.localstack.cloud:4566/000000000000/demo"
 ```
 
 ## Cleanup
 
 ```bash
 # Remove database files
-cargo run -- database clean
+cargo run --release -- database clean
 
 # Stop LocalStack
 docker compose down

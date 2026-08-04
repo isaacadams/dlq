@@ -8,29 +8,30 @@ This project uses `cargo-nextest` for running tests.
 # Install
 cargo install cargo-nextest --locked
 
+# Prefer --release so test builds do not fill target/debug
 # Unit tests (fast, run frequently)
-cargo nextest run --lib
+cargo nextest run --release --lib
 
 # Integration tests (slower, uses LocalStack)
-cargo nextest run --test '*'
+cargo nextest run --release --test '*'
 
 # Property tests (slowest)
-cargo nextest run --features prop-tests
+cargo nextest run --release --features prop-tests
 
 # All tests
-cargo nextest run --workspace
+cargo nextest run --release --workspace
 
 # Doctests (nextest doesn't support these)
-cargo test --doc
+cargo test --release --doc
 
 # Specific test
-cargo nextest run test_name
+cargo nextest run --release test_name
 
 # With output
-cargo nextest run --nocapture
+cargo nextest run --release --nocapture
 
 # With logging
-RUST_LOG=debug cargo nextest run test_name
+RUST_LOG=debug cargo nextest run --release test_name
 ```
 
 ## Test Organization
@@ -47,23 +48,23 @@ Property tests use `proptest` to verify invariants with random inputs. They're s
 
 ```bash
 # Run property tests
-cargo nextest run --features prop-tests
+cargo nextest run --release --features prop-tests
 
 # More test cases (default is 10)
-PROPTEST_CASES=100 cargo nextest run --features prop-tests
+PROPTEST_CASES=100 cargo nextest run --release --features prop-tests
 ```
 
 ## CI
 
 The CI runs all tests with:
 ```bash
-cargo nextest run --workspace --profile ci
+cargo nextest run --release --workspace --profile ci
 ```
 
 ## Troubleshooting
 
-**Tests timeout**: `cargo nextest run --slow-timeout 120`
+**Tests timeout**: `cargo nextest run --release --slow-timeout 120`
 
 **Port conflicts**: Integration tests run sequentially by default. If issues persist: `--test-threads 1`
 
-**Flaky tests**: `cargo nextest run --retries 3`
+**Flaky tests**: `cargo nextest run --release --retries 3`

@@ -11,7 +11,7 @@ def "main poll" [
         $env.AWS_ENDPOINT_URL = "http://localhost:4566"
     }
     open queue.db | query db $"drop table if exists `($profile)`;"
-    cargo run poll $queue
+    cargo run --release -- poll $queue
         | lines 
         | each { $in | from json } 
         | into sqlite queue.db -t $profile

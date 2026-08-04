@@ -1,4 +1,18 @@
-# https://doc.rust-lang.org/nightly/cargo/reference/config.html
+# https://doc.rust-lang.org/cargo/reference/config.html
+#
+# This workspace builds in release mode by default (scripts, aliases, rust-analyzer).
+# Debug artifacts are much larger on disk; prefer `cargo build --release` / the aliases below.
 
 [alias]
-tidy = ["clippy", "--", "-D", "warnings"]
+# Cargo cannot override built-in `build`/`run`/`test`, so use these shortcuts.
+b = ["build", "--release"]
+br = ["build", "--release"]
+r = ["run", "--release"]
+rr = ["run", "--release"]
+t = ["test", "--release"]
+tr = ["test", "--release"]
+tidy = ["clippy", "--release", "--", "-D", "warnings"]
+
+[build]
+# Incremental compilation caches are a major source of target/ disk growth.
+incremental = false

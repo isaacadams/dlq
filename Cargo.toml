@@ -1,3 +1,22 @@
 [workspace]
 members = [ "crates/*" ]
 resolver = "2"
+
+# Prefer release-mode artifacts to keep disk usage down.
+# Scripts, aliases, and rust-analyzer are wired to --release; these
+# profile settings make accidental debug/test builds much smaller too.
+
+[profile.dev]
+# No DWARF debug info / incremental caches (the main disk hogs).
+debug = false
+incremental = false
+strip = "debuginfo"
+
+[profile.test]
+debug = false
+incremental = false
+strip = "debuginfo"
+
+[profile.release]
+incremental = false
+strip = true
