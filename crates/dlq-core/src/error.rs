@@ -40,7 +40,7 @@ pub enum Error {
     },
 
     /// `SendMessageBatch` succeeded, but SQS rejected some of the entries.
-    #[error("SQS rejected {} of {total} messages sent to {queue_url}: {}", failed.len(), summarize(failed))]
+    #[error("SQS rejected {} of {total} messages sent to {queue_url}: {}", failed.len(), summarize_codes(failed))]
     PartialSend {
         queue_url: String,
         total: usize,
@@ -95,6 +95,22 @@ pub enum Error {
         source: Box<SdkError<ChangeMessageVisibilityBatchError>>,
     },
 
+    /// `ChangeMessageVisibilityBatch` succeeded, but SQS rejected some entries.
+    #[error("SQS could not change visibility of {} message(s) in {queue_url}: {}", failed.len(), summarize_codes(failed))]
+    PartialVisibilityChange {
+        queue_url: String,
+        failed: Vec<BatchEntryFailure>,
+    },
+
+    /// A redrive stopped part way. `summary` describes what happened before the
+    /// failure, including messages delivered but not deleted from the source.
+    #[error("redrive stopped after moving {} message(s)", summary.moved)]
+    RedriveInterrupted {
+        summary: Box<crate::RedriveSummary>,
+        #[source]
+        source: Box<Error>,
+    },
+
     /// A request entry could not be built (e.g. a required field was missing).
     #[error("failed to build request: {0}")]
     Build(#[from] aws_sdk_sqs::error::BuildError),
@@ -124,8 +140,11 @@ impl From<aws_sdk_sqs::types::BatchResultErrorEntry> for BatchEntryFailure {
     }
 }
 
-fn summarize(failed: &[BatchEntryFailure]) -> String {
-    let mut codes: Vec<&str> = failed.iter().map(|f| f.code.as_str()).collect();
+/// Distinct error codes, sorted and comma-separated.
+pub(crate) fn summarize_codes<'a>(
+    failed: impl IntoIterator<Item = &'a BatchEntryFailure>,
+) -> String {
+    let mut codes: Vec<&str> = failed.into_iter().map(|f| f.code.as_str()).collect();
     codes.sort_unstable();
     codes.dedup();
     codes.join(", ")

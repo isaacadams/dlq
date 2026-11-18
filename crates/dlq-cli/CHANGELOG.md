@@ -11,8 +11,8 @@ All notable changes to the `dlq` CLI are documented here. The format is based on
   to its source queue. If anything isn't moved, it explains what was rejected (with
   SQS error codes), which FIFO groups stopped, and which messages were delivered but
   not deleted (so a re-run would duplicate them).
-- `dlq purge <url>` deletes every message in a queue. Asks you to type the queue name;
-  pass `--yes` in scripts.
+- `dlq purge <url>` deletes every message in a queue. Asks you to type the queue name
+  (refusing URLs it can't read a name from); pass `--yes` in scripts.
 - `dlq completions <shell>` and `dlq man` generate shell completions and a man page.
 - `dlq --version`.
 - `RUST_LOG` controls logging to stderr (default: warnings and errors).
@@ -25,7 +25,9 @@ All notable changes to the `dlq` CLI are documented here. The format is based on
 - Network and AWS errors in `list` and `poll` are reported instead of panicking.
 - `poll` prints each batch as it arrives.
 - Closing stdout early (e.g. `dlq poll ... | head`) exits quietly instead of panicking.
-- `job load` stores non-JSON lines as JSON strings instead of rejecting them.
+- `job load` stores every line exactly as written and sends it byte for byte. It used
+  to reject non-JSON lines and re-serialize JSON ones (reordering keys, rewriting
+  numbers such as `1e2` as `100.0`).
 - `send-batch` claims pending items with one query and syncs SQLite less often (WAL).
 - Minimum supported Rust version is 1.94.1.
 

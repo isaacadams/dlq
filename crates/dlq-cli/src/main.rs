@@ -172,8 +172,9 @@ enum Commands {
     /// Move messages from one queue to another (e.g. a DLQ back to its source queue)
     ///
     /// Each message is deleted from the source only after the destination accepts
-    /// it. Message attributes are kept; FIFO destinations keep the original
-    /// MessageGroupId and MessageDeduplicationId when present.
+    /// it. Message attributes and FIFO MessageGroupIds are kept; FIFO destinations get
+    /// a new MessageDeduplicationId each run, so SQS doesn't drop redriven messages as
+    /// duplicates of their original send.
     Redrive {
         /// URL of the queue to move messages out of (usually the DLQ)
         source_url: String,
@@ -342,10 +343,27 @@ impl Cli {
                 destination_url,
                 limit,
             } => {
-                let summary = dlq.redrive(&source_url, &destination_url, limit).await?;
+                let summary = match dlq.redrive(&source_url, &destination_url, limit).await {
+                    Ok(summary) => summary,
+                    Err(dlq::Error::RedriveInterrupted { summary, source }) => {
+                        println!("Moved {} message(s) before stopping", summary.moved);
+                        let mut message =
+                            format!("redrive stopped: {:#}", anyhow::Error::from(*source));
+                        if let Some(details) = describe_redrive_leftovers(&summary, &source_url) {
+                            message = format!("{message}\n{details}");
+                        }
+                        anyhow::bail!(message);
+                    }
+                    Err(e) => return Err(e.into()),
+                };
                 println!("Moved {} message(s)", summary.moved);
-                if !summary.is_complete() {
-                    anyhow::bail!(describe_incomplete_redrive(&summary, &source_url));
+                if let Some(details) = describe_redrive_leftovers(&summary, &source_url) {
+                    if summary.is_complete() {
+                        // Only messages that stay hidden for a while: worth a warning.
+                        eprintln!("warning: {details}");
+                    } else {
+                        anyhow::bail!("redrive did not move every message:\n{details}");
+                    }
                 }
             }
             Commands::Purge { url, yes } => {
@@ -395,7 +413,9 @@ impl Cli {
 /// Asks the user to type the queue name before purging. Refuses when stdin isn't
 /// a terminal, so scripts must pass `--yes` explicitly.
 fn confirm_purge(url: &str) -> anyhow::Result<()> {
-    let name = url.rsplit('/').next().unwrap_or(url);
+    let Some(name) = queue_name(url) else {
+        anyhow::bail!("can't tell the queue name from {url:?}; pass --yes to purge it anyway");
+    };
     if !std::io::stdin().is_terminal() {
         anyhow::bail!(
             "refusing to purge {name} without confirmation; pass --yes to skip the prompt"
@@ -412,22 +432,15 @@ fn confirm_purge(url: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Explains what a partial redrive left behind, by kind, so the user knows which
-/// messages are safe to redrive again.
-fn describe_incomplete_redrive(summary: &dlq::RedriveSummary, source_url: &str) -> String {
-    fn codes(failures: &[dlq::RedriveFailure]) -> String {
-        let mut codes: Vec<&str> = failures.iter().map(|f| f.error.code.as_str()).collect();
-        codes.sort_unstable();
-        codes.dedup();
-        codes.join(", ")
-    }
-
-    let mut lines = vec!["redrive did not move every message:".to_string()];
+/// Explains what a redrive left behind, by kind, so the user knows which messages
+/// are safe to redrive again. `None` if nothing was left behind.
+fn describe_redrive_leftovers(summary: &dlq::RedriveSummary, source_url: &str) -> Option<String> {
+    let mut lines = Vec::new();
     if !summary.rejected.is_empty() {
         lines.push(format!(
             "  - {} message(s) were rejected by the destination ({}) and remain in {source_url}",
             summary.rejected.len(),
-            codes(&summary.rejected)
+            summary.rejected_codes()
         ));
     }
     if !summary.blocked_groups.is_empty() {
@@ -442,8 +455,41 @@ fn describe_incomplete_redrive(summary: &dlq::RedriveSummary, source_url: &str) 
             "  - {} message(s) WERE delivered but could not be deleted from {source_url} ({}); \
              redriving again will deliver them twice",
             summary.not_deleted.len(),
-            codes(&summary.not_deleted)
+            summary.not_deleted_codes()
         ));
     }
-    lines.join("\n")
+    if !summary.still_hidden.is_empty() {
+        lines.push(format!(
+            "  - {} message(s) could not be made visible again in {source_url}; \
+             they reappear within 15 minutes",
+            summary.still_hidden.len()
+        ));
+    }
+    (!lines.is_empty()).then(|| lines.join("\n"))
+}
+
+/// The queue name at the end of a queue URL, ignoring a trailing slash.
+fn queue_name(url: &str) -> Option<&str> {
+    url.trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .filter(|name| !name.is_empty() && !name.contains(':'))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::queue_name;
+
+    #[test]
+    fn queue_name_from_url() {
+        let url = "https://sqs.us-east-1.amazonaws.com/123456789012/prod-dlq";
+        assert_eq!(queue_name(url), Some("prod-dlq"));
+        // A trailing slash must not turn the name into "" (which an empty answer
+        // at the prompt would match).
+        assert_eq!(queue_name(&format!("{url}/")), Some("prod-dlq"));
+        assert_eq!(queue_name(&format!("{url}//")), Some("prod-dlq"));
+        assert_eq!(queue_name(""), None);
+        assert_eq!(queue_name("/"), None);
+        assert_eq!(queue_name("https://"), None);
+    }
 }

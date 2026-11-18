@@ -9,6 +9,10 @@ use aws_sdk_sqs as sqs;
 /// Retrieves up to 10 messages at a time with a 15-second visibility timeout.
 /// Messages become invisible to other consumers during this period.
 ///
+/// Long-polls for up to a second: that makes SQS check all of its servers, so an empty
+/// response means the queue really has no visible messages (a short poll samples a
+/// subset and can come back empty while messages remain).
+///
 /// # Arguments
 ///
 /// * `client` - The SQS client to use for the request
@@ -31,6 +35,7 @@ pub async fn receive(
         .set_max_number_of_messages(Some(10))
         .set_visibility_timeout(Some(15))
         .message_system_attribute_names(sqs::types::MessageSystemAttributeName::All)
+        .wait_time_seconds(1)
         .send()
         .await
         .map_err(|e| Error::Receive {

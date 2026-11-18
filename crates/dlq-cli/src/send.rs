@@ -747,7 +747,7 @@ fn format_sdk_error(
 }
 
 /// Transform input value to (message_id, message_body) based on input_type
-fn transform_input(input: &Value, input_type: &str) -> (String, String) {
+pub(crate) fn transform_input(input: &Value, input_type: &str) -> (String, String) {
     match input_type {
         "json" => {
             // JSON mode: extract id and body fields

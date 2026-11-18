@@ -24,9 +24,14 @@ All notable changes to `dlq-core` are documented here. The format is based on
   releases them), stops a FIFO group at its first rejected message without sending
   later messages of that group ahead of it (FIFO-to-FIFO batches hold one message per
   group), and rejects
-  redriving a queue into itself. Returns a `RedriveSummary` with per-message
-  `RedriveFailure`s for rejected and delivered-but-not-deleted messages.
+  redriving a queue into itself (comparing queue ARNs when URLs differ only in form).
+  Returns a `RedriveSummary` with per-message `RedriveFailure`s for rejected and
+  delivered-but-not-deleted messages, and `still_hidden` for any that couldn't be made
+  visible again. A run that fails part way returns `Error::RedriveInterrupted` with the
+  summary so far.
 - `poll_with(queue_url, on_message)` streams messages as each batch arrives.
+- `receive`/`poll` long-poll for up to a second, so an empty result means the queue
+  really has no visible messages.
 - `purge(queue_url)`.
 - `Error::PartialSend`: `send_batch` now reports entries SQS rejected (previously
   ignored silently).
