@@ -2,6 +2,7 @@
 
 use aws_sdk_sqs::error::SdkError;
 use aws_sdk_sqs::operation::{
+    change_message_visibility_batch::ChangeMessageVisibilityBatchError,
     delete_message::DeleteMessageError, delete_message_batch::DeleteMessageBatchError,
     get_queue_attributes::GetQueueAttributesError, list_queues::ListQueuesError,
     purge_queue::PurgeQueueError, receive_message::ReceiveMessageError,
@@ -86,6 +87,14 @@ pub enum Error {
     #[error("cannot redrive {queue_url} into itself; source and destination are the same queue")]
     RedriveToSameQueue { queue_url: String },
 
+    /// `ChangeMessageVisibilityBatch` failed.
+    #[error("failed to change message visibility in {queue_url}")]
+    ChangeVisibility {
+        queue_url: String,
+        #[source]
+        source: Box<SdkError<ChangeMessageVisibilityBatchError>>,
+    },
+
     /// A request entry could not be built (e.g. a required field was missing).
     #[error("failed to build request: {0}")]
     Build(#[from] aws_sdk_sqs::error::BuildError),
@@ -102,6 +111,17 @@ pub struct BatchEntryFailure {
     pub message: Option<String>,
     /// Whether the failure was the caller's fault (retrying won't help).
     pub sender_fault: bool,
+}
+
+impl From<aws_sdk_sqs::types::BatchResultErrorEntry> for BatchEntryFailure {
+    fn from(entry: aws_sdk_sqs::types::BatchResultErrorEntry) -> Self {
+        Self {
+            index: entry.id.parse().unwrap_or(usize::MAX),
+            code: entry.code,
+            message: entry.message,
+            sender_fault: entry.sender_fault,
+        }
+    }
 }
 
 fn summarize(failed: &[BatchEntryFailure]) -> String {

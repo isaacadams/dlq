@@ -51,8 +51,18 @@ dlq redrive <SOURCE_URL> <DESTINATION_URL>
 dlq redrive -n 100 <SOURCE_URL> <DESTINATION_URL>
 ```
 
-Messages the destination rejects stay in the source queue, and the command exits
-with status 1.
+If anything can't be moved, the command exits with status 1 and explains what was
+left behind:
+
+- **Rejected** messages (with SQS error codes) stay in the source queue.
+- **FIFO groups** stop at their first rejected message; later messages in the group
+  are not sent, to keep order (some already in the same batch may have been).
+- Messages **delivered but not deleted** are in both queues; redriving again would
+  deliver them twice.
+
+Messages that can't be moved are kept hidden during the run (so they're tried once)
+and made visible again when it ends. For FIFO destinations, each run uses a fresh
+deduplication ID so SQS doesn't discard redriven messages as duplicates.
 
 ### Purge a Queue
 

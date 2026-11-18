@@ -8,6 +8,8 @@
 //!
 //! [ElasticMQ]: https://github.com/softwaremill/elasticmq
 
+use std::time::Duration;
+
 use aws_sdk_sqs::config::Credentials;
 use testcontainers::{ContainerAsync, ImageExt, runners::AsyncRunner};
 use testcontainers_modules::elasticmq::ElasticMq;
@@ -45,34 +47,41 @@ pub struct SqsTestEnv {
 impl SqsTestEnv {
     /// Uses `DLQ_TEST_SQS_ENDPOINT` if set, otherwise starts an ElasticMQ container.
     pub async fn start() -> Self {
-        let (endpoint_url, container) = match std::env::var(SQS_ENDPOINT_ENV) {
-            Ok(url) if !url.is_empty() => (url, None),
-            _ => {
-                let container = ElasticMq::default()
-                    .with_name(ELASTICMQ_IMAGE)
-                    .with_tag(ELASTICMQ_TAG)
-                    .with_copy_to("/opt/elasticmq.conf", ELASTICMQ_CONF.as_bytes().to_vec())
-                    .start()
-                    .await
-                    .expect("failed to start ElasticMQ container (is Docker running?)");
-                let host = container.get_host().await.expect("container host");
-                let port = container
-                    .get_host_port_ipv4(ELASTICMQ_PORT)
-                    .await
-                    .expect("container port");
-                (format!("http://{host}:{port}"), Some(container))
-            }
-        };
-
-        let config = local_config(&endpoint_url).load().await;
-        let client = aws_sdk_sqs::Client::new(&config);
-
-        Self {
-            endpoint_url,
-            config,
-            client,
-            _container: container,
+        if let Ok(url) = std::env::var(SQS_ENDPOINT_ENV)
+            && !url.is_empty()
+        {
+            let (config, client) = connect(&url).await;
+            wait_until_ready(&client, Duration::from_secs(10))
+                .await
+                .unwrap_or_else(|e| panic!("SQS endpoint {url} is not reachable: {e:?}"));
+            return Self {
+                endpoint_url: url,
+                config,
+                client,
+                _container: None,
+            };
         }
+
+        // Under heavy parallel container churn, Docker occasionally publishes a port
+        // that refuses connections even though the server inside is up. Replace such
+        // a container instead of failing the test.
+        let mut last_error = None;
+        for _ in 0..3 {
+            let (endpoint_url, container) = start_container().await;
+            let (config, client) = connect(&endpoint_url).await;
+            match wait_until_ready(&client, Duration::from_secs(5)).await {
+                Ok(()) => {
+                    return Self {
+                        endpoint_url,
+                        config,
+                        client,
+                        _container: Some(container),
+                    };
+                }
+                Err(e) => last_error = Some(e),
+            }
+        }
+        panic!("ElasticMQ container never became reachable: {last_error:?}");
     }
 
     pub fn endpoint_url(&self) -> &str {
@@ -123,6 +132,43 @@ impl SqsTestEnv {
             bodies.extend(messages.into_iter().filter_map(|m| m.body));
         }
         bodies
+    }
+}
+
+async fn start_container() -> (String, ContainerAsync<ElasticMq>) {
+    let container = ElasticMq::default()
+        .with_name(ELASTICMQ_IMAGE)
+        .with_tag(ELASTICMQ_TAG)
+        .with_copy_to("/opt/elasticmq.conf", ELASTICMQ_CONF.as_bytes().to_vec())
+        .start()
+        .await
+        .expect("failed to start ElasticMQ container (is Docker running?)");
+    let host = container.get_host().await.expect("container host");
+    let port = container
+        .get_host_port_ipv4(ELASTICMQ_PORT)
+        .await
+        .expect("container port");
+    (format!("http://{host}:{port}"), container)
+}
+
+async fn connect(endpoint_url: &str) -> (aws_config::SdkConfig, aws_sdk_sqs::Client) {
+    let config = local_config(endpoint_url).load().await;
+    let client = aws_sdk_sqs::Client::new(&config);
+    (config, client)
+}
+
+/// Retries a cheap call until the endpoint answers or `timeout` passes. The server
+/// also logs "started" slightly before Docker's port forwarding accepts connections.
+async fn wait_until_ready(client: &aws_sdk_sqs::Client, timeout: Duration) -> crate::Result<()> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        match client.list_queues().send().await {
+            Ok(_) => return Ok(()),
+            Err(e) if tokio::time::Instant::now() >= deadline => {
+                return Err(crate::Error::ListQueues(Box::new(e)));
+            }
+            Err(_) => tokio::time::sleep(Duration::from_millis(100)).await,
+        }
     }
 }
 

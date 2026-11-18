@@ -17,9 +17,14 @@ All notable changes to `dlq-core` are documented here. The format is based on
 
 ### Added
 - `redrive(source, destination, limit)` moves messages between queues, deleting each
-  from the source only after the destination accepts it. Keeps message attributes
-  and FIFO group/deduplication IDs. Uses long polling so a run never ends early on a
-  falsely empty receive, and rejects redriving a queue into itself.
+  from the source only after the destination accepts it. Keeps message attributes and
+  FIFO group IDs, and uses a fresh deduplication ID per run so SQS can't drop a
+  redriven message as a duplicate. Splits batches by payload size, long-polls so a run
+  never ends early, keeps messages that can't be moved hidden until the run ends (then
+  releases them), stops a FIFO group at its first rejected message, and rejects
+  redriving a queue into itself. Returns a `RedriveSummary` with per-message
+  `RedriveFailure`s for rejected and delivered-but-not-deleted messages.
+- `poll_with(queue_url, on_message)` streams messages as each batch arrives.
 - `purge(queue_url)`.
 - `Error::PartialSend`: `send_batch` now reports entries SQS rejected (previously
   ignored silently).

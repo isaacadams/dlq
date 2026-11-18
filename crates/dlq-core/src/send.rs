@@ -89,15 +89,7 @@ pub(crate) fn check_batch_failures(
     Err(Error::PartialSend {
         queue_url: queue_url.to_string(),
         total,
-        failed: failed
-            .into_iter()
-            .map(|f| BatchEntryFailure {
-                index: f.id.parse().unwrap_or(usize::MAX),
-                code: f.code,
-                message: f.message,
-                sender_fault: f.sender_fault,
-            })
-            .collect(),
+        failed: failed.into_iter().map(BatchEntryFailure::from).collect(),
     })
 }
 

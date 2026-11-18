@@ -232,8 +232,25 @@ impl DeadLetterQueue {
     /// # }
     /// ```
     pub async fn poll(&self, queue_url: &str) -> Result<Vec<MessageModel>> {
-        const MAX_TRIES: usize = 10;
         let mut received = Vec::new();
+        self.poll_with(queue_url, |message| received.push(message))
+            .await?;
+        Ok(received)
+    }
+
+    /// Like [`poll`](Self::poll), but hands each message to `on_message` as soon as its
+    /// batch arrives instead of collecting them, so output can be streamed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Receive`] if the SQS API call fails. Messages from batches
+    /// received before the failure have already been passed to `on_message`.
+    pub async fn poll_with(
+        &self,
+        queue_url: &str,
+        mut on_message: impl FnMut(MessageModel),
+    ) -> Result<()> {
+        const MAX_TRIES: usize = 10;
 
         for _ in 0..MAX_TRIES {
             let output = receive(&self.client, queue_url).await?;
@@ -244,10 +261,13 @@ impl DeadLetterQueue {
                 break;
             }
 
-            received.extend(messages.into_iter().map(MessageModel::from_aws_message));
+            messages
+                .into_iter()
+                .map(MessageModel::from_aws_message)
+                .for_each(&mut on_message);
         }
 
-        Ok(received)
+        Ok(())
     }
 }
 

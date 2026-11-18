@@ -328,9 +328,14 @@ impl Cli {
                 }
             }
             Commands::Poll { url } => {
-                for message in dlq.poll(&url).await? {
-                    println!("{}", serde_json::to_string(&message)?);
-                }
+                // Print each batch as it arrives rather than after every receive.
+                dlq.poll_with(&url, |message| {
+                    println!(
+                        "{}",
+                        serde_json::to_string(&message).expect("MessageModel serializes")
+                    );
+                })
+                .await?;
             }
             Commands::Redrive {
                 source_url,
@@ -339,11 +344,8 @@ impl Cli {
             } => {
                 let summary = dlq.redrive(&source_url, &destination_url, limit).await?;
                 println!("Moved {} message(s)", summary.moved);
-                if summary.failed > 0 {
-                    anyhow::bail!(
-                        "{} message(s) could not be moved and remain in {source_url}",
-                        summary.failed
-                    );
+                if !summary.is_complete() {
+                    anyhow::bail!(describe_incomplete_redrive(&summary, &source_url));
                 }
             }
             Commands::Purge { url, yes } => {
@@ -408,4 +410,40 @@ fn confirm_purge(url: &str) -> anyhow::Result<()> {
         anyhow::bail!("confirmation did not match; nothing was purged");
     }
     Ok(())
+}
+
+/// Explains what a partial redrive left behind, by kind, so the user knows which
+/// messages are safe to redrive again.
+fn describe_incomplete_redrive(summary: &dlq::RedriveSummary, source_url: &str) -> String {
+    fn codes(failures: &[dlq::RedriveFailure]) -> String {
+        let mut codes: Vec<&str> = failures.iter().map(|f| f.error.code.as_str()).collect();
+        codes.sort_unstable();
+        codes.dedup();
+        codes.join(", ")
+    }
+
+    let mut lines = vec!["redrive did not move every message:".to_string()];
+    if !summary.rejected.is_empty() {
+        lines.push(format!(
+            "  - {} message(s) were rejected by the destination ({}) and remain in {source_url}",
+            summary.rejected.len(),
+            codes(&summary.rejected)
+        ));
+    }
+    if !summary.blocked_groups.is_empty() {
+        lines.push(format!(
+            "  - FIFO group(s) {} stopped at a rejected message; their later messages were \
+             not sent, to keep order, and remain in {source_url}",
+            summary.blocked_groups.join(", ")
+        ));
+    }
+    if !summary.not_deleted.is_empty() {
+        lines.push(format!(
+            "  - {} message(s) WERE delivered but could not be deleted from {source_url} ({}); \
+             redriving again will deliver them twice",
+            summary.not_deleted.len(),
+            codes(&summary.not_deleted)
+        ));
+    }
+    lines.join("\n")
 }

@@ -41,5 +41,5 @@ mod sqs;
 pub mod test_utils;
 
 pub use error::{BatchEntryFailure, Error, Result};
-pub use redrive::RedriveSummary;
+pub use redrive::{RedriveFailure, RedriveSummary};
 pub use sqs::*;
