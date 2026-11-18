@@ -1,6 +1,6 @@
 //! SQS client wrapper and message types for dead letter queue operations.
 
-use anyhow::Context;
+use crate::error::{Error, Result};
 use aws_config::SdkConfig;
 use aws_sdk_sqs as sqs;
 
@@ -20,22 +20,23 @@ use aws_sdk_sqs as sqs;
 ///
 /// # Errors
 ///
-/// Returns an error if the SQS API call fails.
+/// Returns [`Error::Receive`] if the SQS API call fails.
 pub async fn receive(
     client: &aws_sdk_sqs::Client,
     queue_url: &str,
-) -> anyhow::Result<aws_sdk_sqs::operation::receive_message::ReceiveMessageOutput> {
-    let result = client
+) -> Result<aws_sdk_sqs::operation::receive_message::ReceiveMessageOutput> {
+    client
         .receive_message()
         .set_queue_url(Some(queue_url.to_string()))
         .set_max_number_of_messages(Some(10))
         .set_visibility_timeout(Some(15))
         .message_system_attribute_names(sqs::types::MessageSystemAttributeName::All)
-        //.set_wait_time_seconds(Some(3))
         .send()
-        .await;
-
-    result.context("failed to receive messages")
+        .await
+        .map_err(|e| Error::Receive {
+            queue_url: queue_url.to_string(),
+            source: Box::new(e),
+        })
 }
 
 /// Client for interacting with AWS SQS dead letter queues.
@@ -48,7 +49,7 @@ pub async fn receive(
 /// ```no_run
 /// use dlq::DeadLetterQueue;
 ///
-/// # async fn example() -> anyhow::Result<()> {
+/// # async fn example() -> Result<(), dlq::Error> {
 /// let config = aws_config::from_env().load().await;
 /// let dlq = DeadLetterQueue::from_config(config);
 ///
@@ -83,7 +84,7 @@ impl DeadLetterQueue {
     /// ```no_run
     /// use dlq::DeadLetterQueue;
     ///
-    /// # async fn example() -> anyhow::Result<()> {
+    /// # async fn example() -> Result<(), dlq::Error> {
     /// let config = aws_config::from_env().load().await;
     /// let dlq = DeadLetterQueue::from_config(config);
     ///
@@ -106,15 +107,40 @@ impl DeadLetterQueue {
     ///
     /// # Errors
     ///
-    /// Returns an error if the SQS API call fails.
-    pub async fn delete(&self, queue_url: &str, receipt_handle: &str) -> anyhow::Result<()> {
+    /// Returns [`Error::Delete`] if the SQS API call fails.
+    pub async fn delete(&self, queue_url: &str, receipt_handle: &str) -> Result<()> {
         self.client
             .delete_message()
             .queue_url(queue_url)
             .receipt_handle(receipt_handle)
             .send()
             .await
-            .context("failed to delete message")?;
+            .map_err(|e| Error::Delete {
+                queue_url: queue_url.to_string(),
+                source: Box::new(e),
+            })?;
+        Ok(())
+    }
+
+    /// Deletes every message in a queue. This cannot be undone.
+    ///
+    /// SQS allows one purge per queue every 60 seconds, and deletion can take up
+    /// to 60 seconds to finish.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Purge`] if the SQS API call fails (including
+    /// `PurgeQueueInProgress` when purged again within 60 seconds).
+    pub async fn purge(&self, queue_url: &str) -> Result<()> {
+        self.client
+            .purge_queue()
+            .queue_url(queue_url)
+            .send()
+            .await
+            .map_err(|e| Error::Purge {
+                queue_url: queue_url.to_string(),
+                source: Box::new(e),
+            })?;
         Ok(())
     }
 
@@ -128,15 +154,15 @@ impl DeadLetterQueue {
     ///
     /// # Errors
     ///
-    /// Returns an error if the SQS API call fails (e.g. bad credentials or an
-    /// unreachable endpoint).
+    /// Returns [`Error::ListQueues`] if the SQS API call fails (e.g. bad
+    /// credentials or an unreachable endpoint).
     ///
     /// # Example
     ///
     /// ```no_run
     /// use dlq::DeadLetterQueue;
     ///
-    /// # async fn example() -> anyhow::Result<()> {
+    /// # async fn example() -> Result<(), dlq::Error> {
     /// let config = aws_config::from_env().load().await;
     /// let dlq = DeadLetterQueue::from_config(config);
     ///
@@ -146,7 +172,7 @@ impl DeadLetterQueue {
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn list(&self) -> anyhow::Result<Vec<String>> {
+    pub async fn list(&self) -> Result<Vec<String>> {
         let mut queues = Vec::new();
 
         let mut output = self
@@ -154,7 +180,7 @@ impl DeadLetterQueue {
             .list_queues()
             .send()
             .await
-            .context("failed to list queues")?;
+            .map_err(|e| Error::ListQueues(Box::new(e)))?;
         loop {
             if let Some(mut list) = output.queue_urls {
                 queues.append(&mut list);
@@ -170,7 +196,7 @@ impl DeadLetterQueue {
                 .set_next_token(Some(token))
                 .send()
                 .await
-                .context("failed to list queues")?;
+                .map_err(|e| Error::ListQueues(Box::new(e)))?;
         }
 
         Ok(queues)
@@ -188,14 +214,14 @@ impl DeadLetterQueue {
     ///
     /// # Errors
     ///
-    /// Returns an error if the SQS API call fails.
+    /// Returns [`Error::Receive`] if the SQS API call fails.
     ///
     /// # Example
     ///
     /// ```no_run
     /// use dlq::DeadLetterQueue;
     ///
-    /// # async fn example() -> anyhow::Result<()> {
+    /// # async fn example() -> Result<(), dlq::Error> {
     /// let config = aws_config::from_env().load().await;
     /// let dlq = DeadLetterQueue::from_config(config);
     ///
@@ -205,7 +231,7 @@ impl DeadLetterQueue {
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn poll(&self, queue_url: &str) -> anyhow::Result<Vec<MessageModel>> {
+    pub async fn poll(&self, queue_url: &str) -> Result<Vec<MessageModel>> {
         const MAX_TRIES: usize = 10;
         let mut received = Vec::new();
 

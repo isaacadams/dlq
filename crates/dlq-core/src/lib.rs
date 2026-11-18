@@ -16,7 +16,7 @@
 //! ```no_run
 //! use dlq::DeadLetterQueue;
 //!
-//! # async fn example() -> anyhow::Result<()> {
+//! # async fn example() -> Result<(), dlq::Error> {
 //! // Load AWS configuration
 //! let config = aws_config::from_env().load().await;
 //!
@@ -31,6 +31,8 @@
 //! # }
 //! ```
 
+mod error;
+mod redrive;
 mod send;
 mod sqs;
 
@@ -38,4 +40,6 @@ mod sqs;
 #[doc(hidden)]
 pub mod test_utils;
 
+pub use error::{BatchEntryFailure, Error, Result};
+pub use redrive::RedriveSummary;
 pub use sqs::*;

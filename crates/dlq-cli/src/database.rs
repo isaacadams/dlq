@@ -39,6 +39,10 @@ pub enum JobCommands {
     Reset { id: i64 },
 }
 
+/// Display format for job timestamps (stored as UTC by SQLite's CURRENT_TIMESTAMP).
+const TIMESTAMP_FORMAT: &[time::format_description::BorrowedFormatItem<'static>] =
+    time::macros::format_description!("[year]-[month]-[day] [hour]:[minute]:[second]");
+
 impl JobCommands {
     pub async fn run(self) -> anyhow::Result<()> {
         match self {
@@ -49,7 +53,7 @@ impl JobCommands {
                 for job in jobs {
                     println!(
                         "[{}] {} #{} (input_type: {})",
-                        job.timestamp_start.format("%Y-%m-%d %H:%M:%S"),
+                        job.timestamp_start.format(TIMESTAMP_FORMAT)?,
                         job.name,
                         job.id,
                         job.configuration.input_type
@@ -155,9 +159,9 @@ pub struct JobModel {
     /// Job configuration (input type, etc.)
     pub configuration: Json<JobConfiguration>,
     /// When the job was created
-    pub timestamp_start: sqlx::types::chrono::DateTime<sqlx::types::chrono::Utc>,
+    pub timestamp_start: time::PrimitiveDateTime,
     /// When the job completed (None if still running)
-    pub timestamp_end: Option<sqlx::types::chrono::DateTime<sqlx::types::chrono::Utc>>,
+    pub timestamp_end: Option<time::PrimitiveDateTime>,
 }
 
 /// An individual item within a job.
@@ -195,7 +199,7 @@ pub struct RetryHistoryModel {
     /// Snapshot of input at time of retry
     pub input_snapshot: Option<Json<Value>>,
     /// When this retry occurred
-    pub timestamp: sqlx::types::chrono::DateTime<sqlx::types::chrono::Utc>,
+    pub timestamp: time::PrimitiveDateTime,
 }
 
 /// Result of completing a batch of items.

@@ -19,12 +19,20 @@
 //! # Poll messages from a queue
 //! dlq poll https://sqs.us-east-1.amazonaws.com/123456789/my-dlq
 //!
+//! # Move messages from a DLQ back to its source queue
+//! dlq redrive https://sqs.us-east-1.amazonaws.com/123456789/my-dlq https://sqs.us-east-1.amazonaws.com/123456789/my-queue
+//!
 //! # Use a local SQS emulator (see docker-compose.yml)
 //! dlq --local list
+//!
+//! # Debug logging (any `RUST_LOG` filter works)
+//! RUST_LOG=debug dlq list
 //! ```
 
+use std::io::{BufRead, IsTerminal, Write};
+
 use aws_config::SdkConfig;
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
 use dlq::DeadLetterQueue;
 
 #[allow(dead_code)]
@@ -34,10 +42,34 @@ mod send;
 
 #[tokio::main]
 pub async fn main() {
+    reset_sigpipe();
+    init_logging();
+
     if let Err(e) = Cli::parse().run().await {
-        eprintln!("{}", e);
+        // `{:#}` includes the cause chain, e.g. "failed to list queues: dispatch failure: ..."
+        eprintln!("error: {e:#}");
         std::process::exit(1);
     }
+}
+
+/// Exit quietly when stdout is closed early (e.g. `dlq poll ... | head`) instead of
+/// panicking. Rust ignores SIGPIPE by default, which turns it into write errors.
+fn reset_sigpipe() {
+    #[cfg(unix)]
+    // SAFETY: called once at startup before any other threads write to stdout.
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+}
+
+/// Logs to stderr, filtered by `RUST_LOG` (default: warnings and errors only).
+fn init_logging() {
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn"));
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .init();
 }
 
 /// AWS Dead Letter Queue CLI client.
@@ -45,7 +77,7 @@ pub async fn main() {
 /// A command-line tool for interacting with AWS SQS queues, with special focus
 /// on dead letter queue operations like polling messages and batch processing.
 #[derive(Debug, Parser)]
-#[command(name = "dlq")]
+#[command(name = "dlq", version)]
 #[command(about = "aws dead letter queue CLI client written in rust", long_about = None)]
 pub struct Cli {
     /// Use local development mode (test credentials + localhost:4566 endpoint)
@@ -137,6 +169,46 @@ enum Commands {
         url: String,
     },
 
+    /// Move messages from one queue to another (e.g. a DLQ back to its source queue)
+    ///
+    /// Each message is deleted from the source only after the destination accepts
+    /// it. Message attributes are kept; FIFO destinations keep the original
+    /// MessageGroupId and MessageDeduplicationId when present.
+    Redrive {
+        /// URL of the queue to move messages out of (usually the DLQ)
+        source_url: String,
+
+        /// URL of the queue to move messages into
+        destination_url: String,
+
+        /// Maximum number of messages to move (moves all if omitted)
+        #[arg(long, short = 'n')]
+        limit: Option<usize>,
+    },
+
+    /// Delete every message in a queue (cannot be undone)
+    Purge {
+        /// URL of the queue to purge
+        url: String,
+
+        /// Skip the confirmation prompt
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
+
+    /// Print a shell completion script
+    ///
+    /// Example: `dlq completions zsh > "${fpath[1]}/_dlq"`
+    Completions {
+        /// Shell to generate completions for
+        shell: clap_complete::Shell,
+    },
+
+    /// Print the man page (roff) to stdout
+    ///
+    /// Example: `dlq man > /usr/local/share/man/man1/dlq.1`
+    Man,
+
     /// Interactive message sending mode (reads from stdin)
     Send {
         /// The URL of your SQS queue to send messages to.
@@ -204,6 +276,19 @@ impl Cli {
     /// * `Ok(())` - Command completed successfully
     /// * `Err(anyhow::Error)` - An error occurred during execution
     pub async fn run(self) -> anyhow::Result<()> {
+        // Commands that don't talk to AWS
+        match &self.command {
+            Commands::Completions { shell } => {
+                clap_complete::generate(*shell, &mut Cli::command(), "dlq", &mut std::io::stdout());
+                return Ok(());
+            }
+            Commands::Man => {
+                clap_mangen::Man::new(Cli::command()).render(&mut std::io::stdout())?;
+                return Ok(());
+            }
+            _ => {}
+        }
+
         // Load AWS config once, based on global flags
         let aws_config = load_aws_config(self.local, self.endpoint.as_deref()).await;
         let dlq = DeadLetterQueue::from_config(aws_config.clone());
@@ -247,6 +332,28 @@ impl Cli {
                     println!("{}", serde_json::to_string(&message)?);
                 }
             }
+            Commands::Redrive {
+                source_url,
+                destination_url,
+                limit,
+            } => {
+                let summary = dlq.redrive(&source_url, &destination_url, limit).await?;
+                println!("Moved {} message(s)", summary.moved);
+                if summary.failed > 0 {
+                    anyhow::bail!(
+                        "{} message(s) could not be moved and remain in {source_url}",
+                        summary.failed
+                    );
+                }
+            }
+            Commands::Purge { url, yes } => {
+                if !yes {
+                    confirm_purge(&url)?;
+                }
+                dlq.purge(&url).await?;
+                println!("Purged {url}");
+            }
+            Commands::Completions { .. } | Commands::Man => unreachable!("handled above"),
             Commands::Send { url } => send::run(aws_config, &url).await,
             Commands::SendBatch {
                 job_id,
@@ -281,4 +388,24 @@ impl Cli {
 
         Ok(())
     }
+}
+
+/// Asks the user to type the queue name before purging. Refuses when stdin isn't
+/// a terminal, so scripts must pass `--yes` explicitly.
+fn confirm_purge(url: &str) -> anyhow::Result<()> {
+    let name = url.rsplit('/').next().unwrap_or(url);
+    if !std::io::stdin().is_terminal() {
+        anyhow::bail!(
+            "refusing to purge {name} without confirmation; pass --yes to skip the prompt"
+        );
+    }
+
+    eprint!("This permanently deletes every message in {name}.\nType the queue name to confirm: ");
+    std::io::stderr().flush()?;
+    let mut answer = String::new();
+    std::io::stdin().lock().read_line(&mut answer)?;
+    if answer.trim() != name {
+        anyhow::bail!("confirmation did not match; nothing was purged");
+    }
+    Ok(())
 }

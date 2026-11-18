@@ -6,6 +6,7 @@ authors.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+rust-version.workspace = true
 
 [[bin]]
 name = "dlq"
@@ -16,7 +17,6 @@ clap = { version = "4.5", features = ["derive"] }
 tokio.workspace = true
 aws-config.workspace = true
 aws-sdk-sqs.workspace = true
-log.workspace = true
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -24,12 +24,19 @@ dlq-core = { version = "2.0.0", path = "../dlq-core" }
 pumps = "0.1"
 uuid.workspace = true
 tracing = "0.1"
-sqlx = { version = "0.9", features = ["runtime-tokio", "sqlite", "chrono", "json"] }
+sqlx = { version = "0.9", features = ["runtime-tokio", "sqlite", "time", "json"] }
+time = { version = "0.3", features = ["macros"] }
 indicatif = "0.18"
 async-channel = "2"
+clap_complete = "4.5"
+clap_mangen = "0.2"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
 dlq-core = { path = "../dlq-core", features = ["test-utils"] }
 assert_cmd = "2.2"
 predicates = "3.1"
 tokio-test = "0.4.4"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
