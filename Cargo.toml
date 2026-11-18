@@ -1,6 +1,25 @@
 [workspace]
 members = [ "crates/*" ]
-resolver = "2"
+resolver = "3"
+
+[workspace.package]
+authors = ["Isaac Adams"]
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/isaacadams/dlq"
+
+[workspace.dependencies]
+anyhow = "1.0"
+aws-config = { version = "1.5", features = ["behavior-version-latest"] }
+aws-sdk-sqs = "1"
+log = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "parking_lot"] }
+uuid = { version = "1.18", features = ["v4"] }
+# Test support (ElasticMQ provides a lightweight, license-free SQS emulator)
+testcontainers = "0.27"
+testcontainers-modules = { version = "0.15", features = ["elasticmq"] }
 
 # Prefer release-mode artifacts to keep disk usage down.
 # Scripts, aliases, and rust-analyzer are wired to --release; these

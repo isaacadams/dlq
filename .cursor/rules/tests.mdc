@@ -4,61 +4,11 @@ alwaysApply: true
 
 # Testing Guidelines for DLQ Project
 
-## Test Organization
+See `docs/TESTING.md` for full details.
 
-This project uses `cargo-nextest` as the test runner.
-
-### Unit Tests
-- Located in `#[cfg(test)]` modules within regular source files under `src/`
-- Fast, isolated tests with no external dependencies
-- **Run by default** with `cargo nextest run --lib`
-
-### Integration Tests  
-- Located in `tests/` directory at package root
-- Test public API and cross-module functionality
-- May use external resources (databases, containers, etc.)
-- **Slower and NOT run by default** - must be explicitly called
-- Run separately with `cargo nextest run --test '*'`
-
-## Running Tests
-
-**Default (unit tests only):**
-```bash
-cargo nextest run --lib
-```
-
-**Integration tests only:**
-```bash
-cargo nextest run --test '*'
-```
-
-**All tests (unit + integration):**
-```bash
-cargo nextest run
-```
-
-**Specific package:**
-```bash
-cargo nextest run -p dlq-core --lib     # Unit tests only
-cargo nextest run -p dlq-core           # All tests
-```
-
-## CI Configuration
-
-The CI pipeline (`.github/workflows/ci.yml`) runs all tests together using:
-```bash
-cargo nextest run --workspace --profile ci
-```
-
-## Nextest Configuration
-
-- Configuration is in `.config/nextest.toml`
-- **Do NOT configure retry logic by default**
-- Only add retry configuration when specifically needed for a particular test group
-- Nextest runs tests in parallel by default for better performance
-
-## Installation
-
-```bash
-cargo install cargo-nextest --locked
-```
+- Use `cargo-nextest`: `cargo nextest run --release` runs everything (doctests: `cargo test --release --doc`).
+- Unit tests live in `#[cfg(test)]` modules under `src/`; CLI end-to-end tests live in `crates/dlq-cli/tests/`.
+- Tests that need SQS must use `dlq::test_utils::SqsTestEnv` (ElasticMQ via testcontainers, or
+  `DLQ_TEST_SQS_ENDPOINT` for a shared server). Create queues with `env.create_queue(prefix)` so
+  names are unique and tests can run in parallel. Never hardcode endpoints or shell out to the `aws` CLI.
+- Do not configure retries by default; fix flaky tests instead.

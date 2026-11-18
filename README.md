@@ -1,6 +1,6 @@
 # DLQ - Dead Letter Queue CLI
 
-A powerful Rust CLI tool for working with AWS SQS dead letter queues. Supports listing queues, polling messages, batch sending with job management, and local development with LocalStack.
+A powerful Rust CLI tool for working with AWS SQS dead letter queues. Supports listing queues, polling messages, batch sending with job management, and local development against a local SQS emulator.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
@@ -11,7 +11,7 @@ A powerful Rust CLI tool for working with AWS SQS dead letter queues. Supports l
 - 🚀 **Batch Sending** - High-throughput batch message sending with progress tracking
 - 💾 **Job Management** - SQLite-backed job queue for reliable message processing
 - 🔄 **Retry Support** - Automatic retries with configurable limits
-- 🧪 **LocalStack Support** - First-class local development support
+- 🧪 **Local Development** - `--local` mode for SQS emulators (ElasticMQ, LocalStack)
 
 ## Installation
 
@@ -19,6 +19,9 @@ A powerful Rust CLI tool for working with AWS SQS dead letter queues. Supports l
 # Install from crates.io
 cargo install dlq
 ```
+
+Prebuilt binaries for Linux, macOS, and Windows are attached to each
+[`dlq` GitHub release](https://github.com/isaacadams/dlq/releases).
 
 ## Quick Start
 
@@ -49,10 +52,10 @@ dlq poll https://sqs.us-east-1.amazonaws.com/123456789/my-queue
 AWS_PROFILE=production AWS_REGION=eu-west-1 dlq list
 ```
 
-### Local Development with LocalStack
+### Local Development
 
 ```bash
-# Start LocalStack (requires Docker)
+# Start a local SQS server (ElasticMQ on localhost:4566, requires Docker)
 docker compose up -d
 
 # Create a test queue
@@ -60,7 +63,7 @@ aws --endpoint-url=http://localhost:4566 sqs create-queue --queue-name demo
 
 # Use dlq with --local flag
 dlq --local list
-dlq --local poll http://sqs.us-east-1.localhost.localstack.cloud:4566/000000000000/demo
+dlq --local poll http://localhost:4566/000000000000/demo
 ```
 
 For more detailed local development instructions, see [docs/QUICKSTART.md](docs/QUICKSTART.md).

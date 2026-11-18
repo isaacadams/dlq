@@ -16,25 +16,26 @@
 //! ```no_run
 //! use dlq::DeadLetterQueue;
 //!
-//! # async fn example() {
+//! # async fn example() -> anyhow::Result<()> {
 //! // Load AWS configuration
 //! let config = aws_config::from_env().load().await;
 //!
 //! // Create a DLQ client
-//! let dlq = DeadLetterQueue::from_config(config, None);
+//! let dlq = DeadLetterQueue::from_config(config);
 //!
 //! // List all queues
-//! let queues = dlq.list().await;
-//! for url in queues {
+//! for url in dlq.list().await? {
 //!     println!("Queue: {}", url);
 //! }
+//! # Ok(())
 //! # }
 //! ```
 
 mod send;
 mod sqs;
 
-#[cfg(test)]
-mod test_utils;
+#[cfg(feature = "test-utils")]
+#[doc(hidden)]
+pub mod test_utils;
 
 pub use sqs::*;

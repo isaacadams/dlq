@@ -13,9 +13,9 @@ use std::path::Path;
 use indicatif::{ProgressBar, ProgressStyle};
 use serde_json::Value;
 use sqlx::{
+    QueryBuilder, Row,
     sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions},
     types::Json,
-    QueryBuilder, Row,
 };
 use tokio::sync::OnceCell;
 
@@ -226,12 +226,12 @@ async fn pool() -> &'static SqlitePool {
     POOL.get_or_init(|| async {
         let pool = SqlitePoolOptions::new()
             .max_connections(5) // Multiple readers OK with WAL; single writer bottleneck remains
-            .test_before_acquire(true)
             .connect_with(
                 SqliteConnectOptions::new()
                     .create_if_missing(true)
                     .filename("sqs.db")
                     .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal) // Enables better concurrency for reads/writes
+                    .synchronous(sqlx::sqlite::SqliteSynchronous::Normal) // Safe with WAL; avoids an fsync per commit
                     .busy_timeout(std::time::Duration::from_secs(30)), // Wait up to 30s for locks
             )
             .await
@@ -587,70 +587,31 @@ impl Database {
     }
 
     /// Atomically stages a batch of pending items (sets to 'processing') and returns (id, input) pairs.
-    /// Uses a transaction to select-then-update atomically. Filters by job_id if provided.
+    /// A single `UPDATE ... RETURNING` statement claims and fetches in one round trip. Filters by job_id if provided.
     pub async fn stage_pending_items(
         &self,
         job_id: Option<i64>,
         limit: i64,
     ) -> Result<Vec<(i64, Value)>, sqlx::Error> {
-        let mut tx = self.pool().begin().await?;
+        let rows = sqlx::query_as::<_, (i64, Json<Value>)>(
+            r#"
+            UPDATE job_items SET status = 'processing', updated_at = CURRENT_TIMESTAMP
+            WHERE id IN (
+                SELECT id FROM job_items
+                WHERE status = 'pending' AND ($1 IS NULL OR job_id = $1)
+                ORDER BY id LIMIT $2
+            )
+            RETURNING id, input
+            "#,
+        )
+        .bind(job_id)
+        .bind(limit)
+        .fetch_all(self.pool())
+        .await?;
 
-        // Select IDs in tx (ORDER BY id for consistency)
-        let ids_query = if let Some(_jid) = job_id {
-            "SELECT id FROM job_items WHERE job_id = $1 AND status = 'pending' ORDER BY id LIMIT $2"
-        } else {
-            "SELECT id FROM job_items WHERE status = 'pending' ORDER BY id LIMIT $1"
-        };
-
-        let ids_result = if let Some(jid) = job_id {
-            sqlx::query_as::<_, (i64,)>(ids_query)
-                .bind(jid)
-                .bind(limit)
-                .fetch_all(&mut *tx)
-                .await?
-        } else {
-            sqlx::query_as::<_, (i64,)>(ids_query)
-                .bind(limit)
-                .fetch_all(&mut *tx)
-                .await?
-        };
-
-        let ids: Vec<i64> = ids_result.into_iter().map(|row| row.0).collect();
-        if ids.is_empty() {
-            let _ = tx.rollback().await;
-            return Ok(Vec::new());
-        }
-
-        // Update to 'processing' in same tx
-        let placeholders: String = (0..ids.len())
-            .map(|_| "?".to_string())
-            .collect::<Vec<_>>()
-            .join(",");
-
-        let update_query = format!(
-            "UPDATE job_items SET status = 'processing', updated_at = CURRENT_TIMESTAMP WHERE id IN ({placeholders})"
-        );
-        let mut update_stmt = sqlx::query(&update_query);
-        for &id in &ids {
-            update_stmt = update_stmt.bind(id);
-        }
-        update_stmt.execute(&mut *tx).await?;
-
-        tx.commit().await?;
-
-        // Fetch inputs post-commit (safe since status is updated)
-        let placeholders: String = (0..ids.len())
-            .map(|_| "?".to_string())
-            .collect::<Vec<_>>()
-            .join(",");
-        let fetch_query = format!("SELECT id, input FROM job_items WHERE id IN ({placeholders})");
-        let mut fetch_stmt = sqlx::query_as::<_, (i64, Json<Value>)>(&fetch_query);
-        for &id in &ids {
-            fetch_stmt = fetch_stmt.bind(id);
-        }
-        let rows = fetch_stmt.fetch_all(self.pool()).await?;
-
-        Ok(rows.into_iter().map(|row| (row.0, row.1 .0)).collect())
+        let mut items: Vec<(i64, Value)> = rows.into_iter().map(|row| (row.0, row.1.0)).collect();
+        items.sort_unstable_by_key(|(id, _)| *id);
+        Ok(items)
     }
 
     /// Completes a claimed item with output/error, setting status to 'done' or 'failed'.
@@ -906,8 +867,8 @@ impl Database {
                 continue;
             }
 
-            // Store the line as-is (could be text or JSON, we store it as a JSON string)
-            let input_value = serde_json::from_str::<Value>(&line)?;
+            // Store JSON lines as JSON; anything else is stored as a JSON string
+            let input_value = serde_json::from_str::<Value>(&line).unwrap_or(Value::String(line));
             batch.push(input_value);
             count += 1;
 
@@ -1052,19 +1013,19 @@ pub async fn cleanup_database(name: &str) -> anyhow::Result<()> {
     // Delete main database file
     if Path::new(&db_path).exists() {
         std::fs::remove_file(&db_path)?;
-        println!("✓ Deleted {}", &db_path);
+        println!("✓ Deleted {}", db_path);
     }
 
     // Delete WAL file (Write-Ahead Log)
     if Path::new(&wal_path).exists() {
         std::fs::remove_file(&wal_path)?;
-        println!("✓ Deleted {}", &wal_path);
+        println!("✓ Deleted {}", wal_path);
     }
 
     // Delete SHM file (Shared Memory)
     if Path::new(&shm_path).exists() {
         std::fs::remove_file(&shm_path)?;
-        println!("✓ Deleted {}", &shm_path);
+        println!("✓ Deleted {}", shm_path);
     }
 
     println!("✓ Database cleanup complete");

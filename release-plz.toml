@@ -1,0 +1,8 @@
+# https://release-plz.dev/docs/config
+[workspace]
+# Open a release PR with version bumps + changelogs; merging it publishes.
+changelog_update = true
+git_release_enable = true
+# Flag breaking API changes (cargo-semver-checks) in the release PR.
+semver_check = true
+pr_labels = ["release"]

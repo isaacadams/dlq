@@ -1,198 +1,79 @@
-mod common;
+//! Property-based round-trip tests for `send_batch` against a local SQS server.
+//!
+//! Each property starts one runtime and one SQS server, then runs every case against a
+//! fresh queue on that server, so cases are isolated without paying container startup
+//! per case.
 
-use common::create_or_get_queue_url;
-use proptest::prelude::*;
 use std::collections::HashSet;
 
-use crate::common::local_aws_config;
-// Property-based test: Send-receive symmetry
-proptest! {
-    #![proptest_config(ProptestConfig::with_cases(10))]
+use dlq::test_utils::SqsTestEnv;
+use proptest::prelude::*;
+use proptest::test_runner::{Config, TestCaseError, TestRunner};
 
-    #[test]
-    fn prop_send_batch_roundtrip(
-        messages in prop::collection::vec(
-            "[a-zA-Z0-9 ]{1,1000}",  // Alphanumeric + spaces, 1-1000 chars
-            1..10usize  // 1-9 messages (SQS batch limit is 10)
-        )
-    ) {
-        tokio::runtime::Runtime::new().unwrap().block_on(async {
-            let queue_url = create_or_get_queue_url("test-prop-roundtrip");
-            let dlq = dlq::DeadLetterQueue::from_config(local_aws_config().await);
+/// Default case count; override with `PROPTEST_CASES`.
+const CASES: u32 = 10;
 
-            // Send the batch
-            let result = dlq.send_batch(&queue_url, &messages).await;
-            prop_assert!(result.is_ok(), "send_batch should succeed for valid input: {:?}", result);
+/// Runs `strategy` for `CASES` cases, asserting each generated batch round-trips intact.
+fn check_roundtrip(strategy: impl Strategy<Value = Vec<String>>) {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let env = rt.block_on(SqsTestEnv::start());
 
-            // Receive and verify count
-            let receive_output = dlq
-                .client
-                .receive_message()
-                .queue_url(&queue_url)
-                .max_number_of_messages(10)
-                .send()
-                .await
-                .unwrap();
+    let mut runner = TestRunner::new(Config {
+        cases: std::env::var("PROPTEST_CASES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(CASES),
+        source_file: Some(file!()),
+        ..Config::default()
+    });
+    let result = runner.run(&strategy, |messages| rt.block_on(roundtrip(&env, messages)));
 
-            let received = receive_output.messages.unwrap_or_default();
-            prop_assert_eq!(
-                received.len(),
-                messages.len(),
-                "Should receive same number of messages as sent"
-            );
-
-            // Verify all messages received (order independent)
-            let received_bodies: HashSet<_> =
-                received.iter()
-                .map(|m| m.body().unwrap_or("").to_string())
-                .collect();
-
-            let sent_bodies: HashSet<_> =
-                messages.iter()
-                .map(|s| s.to_string())
-                .collect();
-
-            prop_assert_eq!(received_bodies, sent_bodies, "Message content should be preserved");
-
-            Ok(())
-        })?;
+    // Drop the container inside the runtime so it is removed cleanly.
+    rt.block_on(async move { drop(env) });
+    if let Err(e) = result {
+        panic!("{e}\n{runner}");
     }
 }
 
-// Property-based test: Unicode and special characters
-proptest! {
-    #![proptest_config(ProptestConfig::with_cases(10))]
+async fn roundtrip(env: &SqsTestEnv, messages: Vec<String>) -> Result<(), TestCaseError> {
+    let queue_url = env.create_queue("test-prop").await;
 
-    #[test]
-    fn prop_send_unicode_content(
-        messages in prop::collection::vec(
-            "\\PC{1,500}",  // Any unicode character, 1-500 chars
-            1..5usize  // 1-4 messages
-        )
-    ) {
-        tokio::runtime::Runtime::new().unwrap().block_on(async {
-            let queue_url = create_or_get_queue_url("test-prop-unicode");
-            let dlq = dlq::DeadLetterQueue::from_config(local_aws_config().await);
+    let result = env.dlq().send_batch(&queue_url, &messages).await;
+    prop_assert!(result.is_ok(), "send_batch failed: {:?}", result);
 
-            let result = dlq.send_batch(&queue_url, &messages).await;
-            prop_assert!(result.is_ok(), "send_batch should handle unicode content");
+    let received = env.receive_bodies(&queue_url, messages.len()).await;
+    prop_assert_eq!(received.len(), messages.len(), "message count changed");
 
-            // Verify content preservation
-            let receive_output = dlq
-                .client
-                .receive_message()
-                .queue_url(&queue_url)
-                .max_number_of_messages(10)
-                .send()
-                .await
-                .unwrap();
-
-            let received = receive_output.messages.unwrap_or_default();
-            prop_assert_eq!(received.len(), messages.len(), "Should preserve message count");
-
-            // Verify content preservation
-            let received_bodies: HashSet<_> =
-                received.iter()
-                .map(|m| m.body().unwrap_or("").to_string())
-                .collect();
-
-            let sent_bodies: HashSet<_> =
-                messages.iter()
-                .map(|s| s.to_string())
-                .collect();
-
-            prop_assert_eq!(received_bodies, sent_bodies, "Unicode content should be preserved exactly");
-
-            Ok(())
-        })?;
-    }
+    let received: HashSet<_> = received.into_iter().collect();
+    let sent: HashSet<_> = messages.into_iter().collect();
+    prop_assert_eq!(received, sent, "message content changed");
+    Ok(())
 }
 
-// Property-based test: Various batch sizes
-proptest! {
-    #![proptest_config(ProptestConfig::with_cases(10))]
-
-    #[test]
-    fn prop_send_various_batch_sizes(
-        batch_size in 1..10usize,
-        message_template in "[a-z]{10,50}"
-    ) {
-        tokio::runtime::Runtime::new().unwrap().block_on(async {
-            let queue_url = create_or_get_queue_url("test-prop-sizes");
-            let dlq = dlq::DeadLetterQueue::from_config(local_aws_config().await);
-
-            // Generate messages with unique suffixes
-            let messages: Vec<String> = (0..batch_size)
-                .map(|i| format!("{}-{}", message_template, i))
-                .collect();
-
-            let result = dlq.send_batch(&queue_url, &messages).await;
-            prop_assert!(result.is_ok(), "send_batch should handle batch size {}", batch_size);
-
-            // Verify all messages received
-            let receive_output = dlq
-                .client
-                .receive_message()
-                .queue_url(&queue_url)
-                .max_number_of_messages(10)
-                .send()
-                .await
-                .unwrap();
-
-            let received = receive_output.messages.unwrap_or_default();
-            prop_assert_eq!(received.len(), batch_size, "Should receive all {} messages", batch_size);
-
-            Ok(())
-        })?;
-    }
+#[test]
+fn prop_send_batch_roundtrip() {
+    // Alphanumeric + spaces, 1-9 messages (SQS batch limit is 10)
+    check_roundtrip(prop::collection::vec("[a-zA-Z0-9 ]{1,1000}", 1..10usize));
 }
 
-// Property-based test: Edge cases with special strings
-proptest! {
-    #![proptest_config(ProptestConfig::with_cases(10))]
+#[test]
+fn prop_send_unicode_content() {
+    check_roundtrip(prop::collection::vec("\\PC{1,500}", 1..5usize));
+}
 
-    #[test]
-    fn prop_send_special_content(
-        messages in prop::collection::vec(
-            prop::string::string_regex(
-                r#"[ \t\n\r\{\}\[\]"'\\]{1,200}"#  // Special chars, whitespace, JSON-like
-            ).unwrap(),
-            1..5usize
-        ).prop_filter("Filter out empty messages", |msgs| msgs.iter().all(|m| !m.is_empty()))
-    ) {
-        tokio::runtime::Runtime::new().unwrap().block_on(async {
-            let queue_url = create_or_get_queue_url("test-prop-special");
-            let dlq = dlq::DeadLetterQueue::from_config(local_aws_config().await);
+#[test]
+fn prop_send_various_batch_sizes() {
+    // Messages with unique suffixes, so every batch size is fully distinguishable
+    check_roundtrip(
+        (1..10usize, "[a-z]{10,50}").prop_map(|(batch_size, template)| {
+            (0..batch_size).map(|i| format!("{template}-{i}")).collect()
+        }),
+    );
+}
 
-            let result = dlq.send_batch(&queue_url, &messages).await;
-            prop_assert!(result.is_ok(), "send_batch should handle special characters");
-
-            let receive_output = dlq
-                .client
-                .receive_message()
-                .queue_url(&queue_url)
-                .max_number_of_messages(10)
-                .send()
-                .await
-                .unwrap();
-
-            let received = receive_output.messages.unwrap_or_default();
-            prop_assert_eq!(received.len(), messages.len());
-
-            // Verify exact content preservation
-            let received_bodies: HashSet<_> =
-                received.iter()
-                .map(|m| m.body().unwrap_or("").to_string())
-                .collect();
-
-            let sent_bodies: HashSet<_> =
-                messages.iter()
-                .map(|s| s.to_string())
-                .collect();
-
-            prop_assert_eq!(received_bodies, sent_bodies, "Special characters should be preserved");
-
-            Ok(())
-        })?;
-    }
+#[test]
+fn prop_send_special_content() {
+    // Special chars, whitespace, JSON-like
+    let special = prop::string::string_regex(r#"[ \t\n\r\{\}\[\]"'\\]{1,200}"#).unwrap();
+    check_roundtrip(prop::collection::vec(special, 1..5usize));
 }
