@@ -3,7 +3,7 @@
 use std::collections::{HashMap, HashSet};
 
 use aws_sdk_sqs::types::{
-    DeleteMessageBatchRequestEntry, Message, MessageSystemAttributeName,
+    DeleteMessageBatchRequestEntry, Message, MessageSystemAttributeName, QueueAttributeName,
     SendMessageBatchRequestEntry,
 };
 
@@ -14,6 +14,10 @@ use crate::sqs::DeadLetterQueue;
 /// fail to move become visible in the source queue again after this.
 const VISIBILITY_TIMEOUT: i32 = 60;
 
+/// Long-poll wait per receive. Any non-zero wait makes SQS query all of its servers,
+/// so an empty response reliably means no messages are visible (short polling samples
+/// a subset and can come back empty while messages remain).
+const WAIT_TIME_SECONDS: i32 = 1;
 /// Outcome of [`DeadLetterQueue::redrive`].
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct RedriveSummary {
@@ -31,16 +35,17 @@ impl DeadLetterQueue {
     /// messages (at worst one is duplicated). For FIFO destinations, the original
     /// `MessageGroupId` and `MessageDeduplicationId` are kept when present.
     ///
-    /// Stops when the source is empty, `limit` messages have moved, or only messages
-    /// that already failed in this run are left.
+    /// Stops when a long-poll receive finds the source empty, `limit` messages have
+    /// moved, or only messages that already failed in this run are left.
     ///
     /// AWS also offers server-side redrive (`StartMessageMoveTask`) for queues with a
     /// redrive policy; this method works for any pair of queues.
     ///
     /// # Errors
     ///
-    /// Returns an error if receiving, sending, or deleting fails as a whole. Messages
-    /// the destination rejects individually are counted in
+    /// Returns [`Error::RedriveToSameQueue`] if both URLs identify the same queue
+    /// (that would loop forever), and an error if receiving, sending, or deleting fails
+    /// as a whole. Messages the destination rejects individually are counted in
     /// [`RedriveSummary::failed`] instead.
     pub async fn redrive(
         &self,
@@ -48,9 +53,18 @@ impl DeadLetterQueue {
         destination_url: &str,
         limit: Option<usize>,
     ) -> Result<RedriveSummary> {
+        // Compare ARNs rather than URLs, which have several equivalent forms.
+        if self.queue_arn(source_url).await? == self.queue_arn(destination_url).await? {
+            return Err(Error::RedriveToSameQueue {
+                queue_url: source_url.to_string(),
+            });
+        }
+
         let fifo = destination_url.ends_with(".fifo");
         let mut summary = RedriveSummary::default();
         let mut failed_ids: HashSet<String> = HashSet::new();
+        // Consecutive receives that returned only messages that already failed.
+        let mut stale_receives = 0usize;
 
         loop {
             let remaining = limit.map_or(10, |l| l.saturating_sub(summary.moved).min(10));
@@ -64,6 +78,7 @@ impl DeadLetterQueue {
                 .queue_url(source_url)
                 .max_number_of_messages(remaining as i32)
                 .visibility_timeout(VISIBILITY_TIMEOUT)
+                .wait_time_seconds(WAIT_TIME_SECONDS)
                 .message_attribute_names("All")
                 .message_system_attribute_names(MessageSystemAttributeName::MessageGroupId)
                 .message_system_attribute_names(MessageSystemAttributeName::MessageDeduplicationId)
@@ -76,13 +91,25 @@ impl DeadLetterQueue {
                 .messages
                 .unwrap_or_default();
 
+            if messages.is_empty() {
+                break;
+            }
+
             let messages: Vec<Message> = messages
                 .into_iter()
                 .filter(|m| !failed_ids.contains(m.message_id().unwrap_or_default()))
                 .collect();
             if messages.is_empty() {
-                break;
+                // Receiving hides these again for VISIBILITY_TIMEOUT, so later receives
+                // reach other messages. Once enough rounds pass to have hidden every
+                // failed message without finding a new one, only failures remain.
+                stale_receives += 1;
+                if stale_receives > failed_ids.len() / 10 + 1 {
+                    break;
+                }
+                continue;
             }
+            stale_receives = 0;
 
             let entries = messages
                 .iter()
@@ -151,6 +178,26 @@ impl DeadLetterQueue {
         }
 
         Ok(summary)
+    }
+}
+
+impl DeadLetterQueue {
+    async fn queue_arn(&self, queue_url: &str) -> Result<String> {
+        self.client
+            .get_queue_attributes()
+            .queue_url(queue_url)
+            .attribute_names(QueueAttributeName::QueueArn)
+            .send()
+            .await
+            .map_err(|e| Error::QueueAttributes {
+                queue_url: queue_url.to_string(),
+                source: Box::new(e),
+            })?
+            .attributes
+            .and_then(|mut a| a.remove(&QueueAttributeName::QueueArn))
+            .ok_or_else(|| Error::MissingQueueArn {
+                queue_url: queue_url.to_string(),
+            })
     }
 }
 
@@ -289,6 +336,24 @@ mod tests {
             .unwrap();
         assert_eq!(summary.moved, 2);
         assert_eq!(env.receive_bodies(&target_url, 2).await.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_redrive_to_same_queue_is_rejected() {
+        let env = SqsTestEnv::start().await;
+        let queue_url = env.create_queue("redrive-self").await;
+        env.dlq().send_batch(&queue_url, &["a"]).await.unwrap();
+
+        // A different but equivalent URL for the same queue is still caught.
+        let alias = queue_url.replace("127.0.0.1", "localhost");
+        for destination in [&queue_url, &alias] {
+            let result = env.dlq().redrive(&queue_url, destination, None).await;
+            assert!(
+                matches!(result, Err(crate::Error::RedriveToSameQueue { .. })),
+                "{destination}: {result:?}"
+            );
+        }
+        assert_eq!(env.receive_bodies(&queue_url, 1).await, ["a"]);
     }
 
     #[tokio::test]

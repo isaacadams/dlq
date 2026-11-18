@@ -3,8 +3,9 @@
 use aws_sdk_sqs::error::SdkError;
 use aws_sdk_sqs::operation::{
     delete_message::DeleteMessageError, delete_message_batch::DeleteMessageBatchError,
-    list_queues::ListQueuesError, purge_queue::PurgeQueueError,
-    receive_message::ReceiveMessageError, send_message_batch::SendMessageBatchError,
+    get_queue_attributes::GetQueueAttributesError, list_queues::ListQueuesError,
+    purge_queue::PurgeQueueError, receive_message::ReceiveMessageError,
+    send_message_batch::SendMessageBatchError,
 };
 
 /// Result alias for dlq-core operations.
@@ -68,6 +69,22 @@ pub enum Error {
         #[source]
         source: Box<SdkError<PurgeQueueError>>,
     },
+
+    /// `GetQueueAttributes` failed.
+    #[error("failed to read attributes of {queue_url}")]
+    QueueAttributes {
+        queue_url: String,
+        #[source]
+        source: Box<SdkError<GetQueueAttributesError>>,
+    },
+
+    /// SQS did not return a `QueueArn` for the queue.
+    #[error("SQS returned no QueueArn for {queue_url}")]
+    MissingQueueArn { queue_url: String },
+
+    /// Redrive source and destination are the same queue, which would loop forever.
+    #[error("cannot redrive {queue_url} into itself; source and destination are the same queue")]
+    RedriveToSameQueue { queue_url: String },
 
     /// A request entry could not be built (e.g. a required field was missing).
     #[error("failed to build request: {0}")]
