@@ -39,6 +39,10 @@ pub enum JobCommands {
     Reset { id: i64 },
 }
 
+/// Display format for job timestamps (stored as UTC by SQLite's CURRENT_TIMESTAMP).
+const TIMESTAMP_FORMAT: &[time::format_description::BorrowedFormatItem<'static>] =
+    time::macros::format_description!("[year]-[month]-[day] [hour]:[minute]:[second]");
+
 impl JobCommands {
     pub async fn run(self) -> anyhow::Result<()> {
         match self {
@@ -49,7 +53,7 @@ impl JobCommands {
                 for job in jobs {
                     println!(
                         "[{}] {} #{} (input_type: {})",
-                        job.timestamp_start.format("%Y-%m-%d %H:%M:%S"),
+                        job.timestamp_start.format(TIMESTAMP_FORMAT)?,
                         job.name,
                         job.id,
                         job.configuration.input_type
@@ -155,9 +159,9 @@ pub struct JobModel {
     /// Job configuration (input type, etc.)
     pub configuration: Json<JobConfiguration>,
     /// When the job was created
-    pub timestamp_start: sqlx::types::chrono::DateTime<sqlx::types::chrono::Utc>,
+    pub timestamp_start: time::PrimitiveDateTime,
     /// When the job completed (None if still running)
-    pub timestamp_end: Option<sqlx::types::chrono::DateTime<sqlx::types::chrono::Utc>>,
+    pub timestamp_end: Option<time::PrimitiveDateTime>,
 }
 
 /// An individual item within a job.
@@ -195,7 +199,7 @@ pub struct RetryHistoryModel {
     /// Snapshot of input at time of retry
     pub input_snapshot: Option<Json<Value>>,
     /// When this retry occurred
-    pub timestamp: sqlx::types::chrono::DateTime<sqlx::types::chrono::Utc>,
+    pub timestamp: time::PrimitiveDateTime,
 }
 
 /// Result of completing a batch of items.
@@ -867,8 +871,10 @@ impl Database {
                 continue;
             }
 
-            // Store JSON lines as JSON; anything else is stored as a JSON string
-            let input_value = serde_json::from_str::<Value>(&line).unwrap_or(Value::String(line));
+            // Text-mode jobs send each line exactly as written, so store it verbatim:
+            // parsing JSON-looking lines would re-serialize them (reordered keys,
+            // `1e2` -> `100.0`, lost precision on large numbers).
+            let input_value = Value::String(line);
             batch.push(input_value);
             count += 1;
 
@@ -1423,6 +1429,40 @@ mod tests {
         let job = db.get_job(job_id).await.unwrap().unwrap();
         assert_eq!(job.name, "load_test");
         assert_eq!(job.configuration.input_type, "text");
+    }
+
+    #[tokio::test]
+    async fn test_load_job_items_keeps_lines_verbatim() {
+        use std::io::Write;
+
+        let db = test_db().await;
+        let lines = [
+            r#"{"b":1, "a":2}"#,
+            "1e2",
+            "12345678901234567890123",
+            r#""quoted""#,
+            "plain text",
+        ];
+        let temp_path =
+            std::env::temp_dir().join(format!("dlq_test_verbatim_{}.jsonl", std::process::id()));
+        {
+            let mut file = std::fs::File::create(&temp_path).unwrap();
+            for line in lines {
+                writeln!(file, "{line}").unwrap();
+            }
+        }
+
+        let result = db.load_job_items("verbatim", Some(&temp_path)).await;
+        let _ = std::fs::remove_file(&temp_path);
+        let (job_id, count) = result.unwrap();
+        assert_eq!(count, lines.len());
+
+        let staged = db.stage_pending_items(Some(job_id), 10).await.unwrap();
+        let bodies: Vec<String> = staged
+            .iter()
+            .map(|(_, input)| crate::send::transform_input(input, "text").1)
+            .collect();
+        assert_eq!(bodies, lines);
     }
 
     // -------------------------------------------------------------------------

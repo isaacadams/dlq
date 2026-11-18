@@ -1,33 +1,8 @@
 //! Batch message sending functionality for SQS.
 
+use crate::error::{BatchEntryFailure, Error, Result};
 use crate::sqs::DeadLetterQueue;
-use std::fmt;
-
-/// Errors that can occur when sending messages to SQS.
-#[derive(Debug)]
-pub enum SendError {
-    /// Failed to build a valid SQS message entry.
-    BuildEntryFailed(String),
-    /// An error occurred in the AWS SDK.
-    AwsSdkError(
-        Box<
-            aws_sdk_sqs::error::SdkError<
-                aws_sdk_sqs::operation::send_message_batch::SendMessageBatchError,
-            >,
-        >,
-    ),
-}
-
-impl fmt::Display for SendError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            SendError::BuildEntryFailed(msg) => write!(f, "failed to build message entry: {}", msg),
-            SendError::AwsSdkError(e) => write!(f, "AWS SDK error: {}", e),
-        }
-    }
-}
-
-impl std::error::Error for SendError {}
+use aws_sdk_sqs::types::{BatchResultErrorEntry, SendMessageBatchRequestEntry};
 
 impl DeadLetterQueue {
     /// Sends multiple messages to SQS in a single batch request.
@@ -44,12 +19,11 @@ impl DeadLetterQueue {
     /// # Returns
     ///
     /// * `Ok(())` - All messages were sent successfully
-    /// * `Err(SendError)` - An error occurred during the send operation
     ///
     /// # Errors
     ///
-    /// - `SendError::BuildEntryFailed` - A message entry couldn't be constructed
-    /// - `SendError::AwsSdkError` - The SQS API returned an error
+    /// - [`Error::Send`] - The SQS API call failed
+    /// - [`Error::PartialSend`] - SQS rejected some entries (the rest were sent)
     ///
     /// # Example
     ///
@@ -69,41 +43,54 @@ impl DeadLetterQueue {
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn send_batch(
-        &self,
-        queue_url: &str,
-        messages: &[impl AsRef<str>],
-    ) -> Result<(), SendError> {
+    pub async fn send_batch(&self, queue_url: &str, messages: &[impl AsRef<str>]) -> Result<()> {
         // Early return for empty batches - SQS doesn't allow empty batch requests
         if messages.is_empty() {
             return Ok(());
         }
 
-        let entries: Result<Vec<_>, SendError> = messages
+        // Entry ids are batch indexes, so failures map straight back to the input.
+        let entries = messages
             .iter()
-            .map(|message| {
-                let id = uuid::Uuid::new_v4().to_string();
-                let body = message.as_ref().to_string();
-                aws_sdk_sqs::types::SendMessageBatchRequestEntry::builder()
-                    .id(id)
-                    .message_body(body)
+            .enumerate()
+            .map(|(i, message)| {
+                SendMessageBatchRequestEntry::builder()
+                    .id(i.to_string())
+                    .message_body(message.as_ref())
                     .build()
-                    .map_err(|e| SendError::BuildEntryFailed(e.to_string()))
             })
-            .collect();
+            .collect::<Result<Vec<_>, _>>()?;
 
-        let entries = entries?;
-
-        self.client
+        let output = self
+            .client
             .send_message_batch()
             .queue_url(queue_url)
             .set_entries(Some(entries))
             .send()
             .await
-            .map_err(|e| SendError::AwsSdkError(Box::new(e)))?;
+            .map_err(|e| Error::Send {
+                queue_url: queue_url.to_string(),
+                source: Box::new(e),
+            })?;
 
-        Ok(())
+        check_batch_failures(queue_url, messages.len(), output.failed)
     }
+}
+
+/// Converts a batch response's `failed` entries into [`Error::PartialSend`].
+pub(crate) fn check_batch_failures(
+    queue_url: &str,
+    total: usize,
+    failed: Vec<BatchResultErrorEntry>,
+) -> Result<()> {
+    if failed.is_empty() {
+        return Ok(());
+    }
+    Err(Error::PartialSend {
+        queue_url: queue_url.to_string(),
+        total,
+        failed: failed.into_iter().map(BatchEntryFailure::from).collect(),
+    })
 }
 
 #[cfg(test)]
@@ -123,6 +110,25 @@ mod tests {
         let mut received = env.receive_bodies(&queue_url, 3).await;
         received.sort();
         assert_eq!(received, ["message1", "message2", "message3"]);
+    }
+
+    #[tokio::test]
+    async fn test_send_batch_reports_rejected_entries() {
+        let env = SqsTestEnv::start().await;
+        let queue_url = env.create_queue("test-partial").await;
+
+        // SQS rejects bodies containing characters outside its allowed set
+        // (InvalidMessageContents); the valid message is still sent.
+        let result = env.dlq().send_batch(&queue_url, &["ok", "bad\u{0}"]).await;
+
+        match result {
+            Err(crate::Error::PartialSend { total, failed, .. }) => {
+                assert_eq!(total, 2);
+                assert_eq!(failed.len(), 1);
+                assert_eq!(failed[0].index, 1);
+            }
+            other => panic!("expected PartialSend, got {other:?}"),
+        }
     }
 
     #[tokio::test]

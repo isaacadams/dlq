@@ -1,0 +1,41 @@
+# cargo-deny: security advisories, licenses, and dependency sources.
+# https://embarkstudios.github.io/cargo-deny/
+
+[graph]
+# Check what ships. Test-only crates (testcontainers via dev-dependencies and the
+# internal `test-utils` feature) are excluded.
+exclude-dev = true
+
+[advisories]
+# RustSec advisories (vulnerabilities, unmaintained, yanked) fail the check.
+yanked = "deny"
+ignore = [
+    # testcontainers' tar dependency; only used by tests (`test-utils` feature), never
+    # shipped. Revisit when testcontainers moves off it.
+    { id = "RUSTSEC-2026-0440", reason = "test-only dependency via testcontainers" },
+]
+
+[licenses]
+# Permissive licenses compatible with distributing an MIT binary.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+    "CC0-1.0",
+]
+confidence-threshold = 0.9
+
+[bans]
+# Duplicate versions are common in the AWS SDK tree; report without failing.
+multiple-versions = "warn"
+wildcards = "deny"
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

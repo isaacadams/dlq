@@ -37,6 +37,43 @@ Receive and display messages from a queue as JSON.
 dlq poll https://sqs.us-east-1.amazonaws.com/123456789/my-dlq
 ```
 
+### Redrive Messages
+
+Move messages from one queue to another, typically from a DLQ back to its source
+queue. Each message is deleted from the source only after the destination accepts it,
+so a failure never loses messages. Message attributes are kept, and FIFO destinations
+keep the original `MessageGroupId` and `MessageDeduplicationId`.
+
+```bash
+dlq redrive <SOURCE_URL> <DESTINATION_URL>
+
+# Move at most 100 messages
+dlq redrive -n 100 <SOURCE_URL> <DESTINATION_URL>
+```
+
+If anything can't be moved, the command exits with status 1 and explains what was
+left behind:
+
+- **Rejected** messages (with SQS error codes) stay in the source queue.
+- **FIFO groups** stop at their first rejected message; later messages in the group
+  are not sent, to keep order.
+- Messages **delivered but not deleted** are in both queues; redriving again would
+  deliver them twice.
+
+Messages that can't be moved are kept hidden during the run (so they're tried once)
+and made visible again when it ends. For FIFO destinations, each run uses a fresh
+deduplication ID so SQS doesn't discard redriven messages as duplicates.
+
+### Purge a Queue
+
+Delete every message in a queue. This cannot be undone, so `dlq` asks you to type
+the queue name first. Pass `--yes` to skip the prompt in scripts.
+
+```bash
+dlq purge <QUEUE_URL>
+dlq purge --yes <QUEUE_URL>
+```
+
 ### Show AWS Info
 
 Display current AWS configuration (endpoint, region, credentials).
@@ -161,10 +198,25 @@ dlq database seed test_job --items 1000 -p
 dlq --local send-batch 1 http://localhost:4566/000000000000/demo
 ```
 
+## Shell Completions and Man Page
+
+```bash
+# bash
+dlq completions bash > ~/.local/share/bash-completion/completions/dlq
+# zsh (any directory on your $fpath)
+dlq completions zsh > "${fpath[1]}/_dlq"
+# fish
+dlq completions fish > ~/.config/fish/completions/dlq.fish
+
+# man page
+dlq man > /usr/local/share/man/man1/dlq.1
+```
+
 ## Environment Variables
 
 | Variable | Description |
 |----------|-------------|
+| `RUST_LOG` | Log filter for stderr output, e.g. `debug` or `dlq=debug,aws_config=info` (default: `warn`) |
 | `AWS_PROFILE` | AWS profile to use |
 | `AWS_REGION` | AWS region |
 | `AWS_ACCESS_KEY_ID` | AWS access key |

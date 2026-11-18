@@ -3,8 +3,8 @@ name: CI
 on:
   push:
     branches: ['main']
+  # All PRs, including ones stacked on other branches.
   pull_request:
-    branches: ['main']
 
 permissions:
   contents: read
@@ -19,7 +19,7 @@ env:
   RUST_BACKTRACE: short
 
 jobs:
-  # One job so lint, build, and tests share a single compile and cache.
+  # Lint, build, and test share a single job so they share one compile and cache.
   ci:
     name: Lint and Test
     runs-on: ubuntu-latest
@@ -30,15 +30,15 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          components: rustfmt, clippy
+          components: rustfmt, clippy, llvm-tools-preview
 
       - name: Rust Cache
         uses: Swatinem/rust-cache@v2
 
-      - name: Install nextest
+      - name: Install nextest and cargo-llvm-cov
         uses: taiki-e/install-action@v2
         with:
-          tool: cargo-nextest
+          tool: cargo-nextest,cargo-llvm-cov
 
       - name: Check formatting
         run: cargo fmt --all -- --check
@@ -51,8 +51,50 @@ jobs:
       - name: Pull ElasticMQ image
         run: docker pull softwaremill/elasticmq-native:1.7.1
 
-      - name: Tests
-        run: cargo nextest run --workspace --all-targets --profile ci
+      - name: Tests (with coverage)
+        run: cargo llvm-cov nextest --workspace --all-targets --profile ci --lcov --output-path lcov.info
+
+      - name: Coverage summary
+        run: |
+          {
+            echo '## Coverage'
+            echo '```'
+            cargo llvm-cov report --summary-only
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v4
+        with:
+          name: lcov
+          path: lcov.info
 
       - name: Doctests
         run: cargo test --workspace --doc
+
+  deny:
+    name: Dependencies (cargo-deny)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories bans licenses sources
+
+  msrv:
+    name: MSRV (1.94.1)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      # Keep in sync with `rust-version` in Cargo.toml.
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.94.1
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check
+        run: cargo check --workspace --locked

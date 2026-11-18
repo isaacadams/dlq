@@ -19,12 +19,20 @@
 //! # Poll messages from a queue
 //! dlq poll https://sqs.us-east-1.amazonaws.com/123456789/my-dlq
 //!
+//! # Move messages from a DLQ back to its source queue
+//! dlq redrive https://sqs.us-east-1.amazonaws.com/123456789/my-dlq https://sqs.us-east-1.amazonaws.com/123456789/my-queue
+//!
 //! # Use a local SQS emulator (see docker-compose.yml)
 //! dlq --local list
+//!
+//! # Debug logging (any `RUST_LOG` filter works)
+//! RUST_LOG=debug dlq list
 //! ```
 
+use std::io::{BufRead, IsTerminal, Write};
+
 use aws_config::SdkConfig;
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
 use dlq::DeadLetterQueue;
 
 #[allow(dead_code)]
@@ -34,10 +42,34 @@ mod send;
 
 #[tokio::main]
 pub async fn main() {
+    reset_sigpipe();
+    init_logging();
+
     if let Err(e) = Cli::parse().run().await {
-        eprintln!("{}", e);
+        // `{:#}` includes the cause chain, e.g. "failed to list queues: dispatch failure: ..."
+        eprintln!("error: {e:#}");
         std::process::exit(1);
     }
+}
+
+/// Exit quietly when stdout is closed early (e.g. `dlq poll ... | head`) instead of
+/// panicking. Rust ignores SIGPIPE by default, which turns it into write errors.
+fn reset_sigpipe() {
+    #[cfg(unix)]
+    // SAFETY: called once at startup before any other threads write to stdout.
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+}
+
+/// Logs to stderr, filtered by `RUST_LOG` (default: warnings and errors only).
+fn init_logging() {
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn"));
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .init();
 }
 
 /// AWS Dead Letter Queue CLI client.
@@ -45,7 +77,7 @@ pub async fn main() {
 /// A command-line tool for interacting with AWS SQS queues, with special focus
 /// on dead letter queue operations like polling messages and batch processing.
 #[derive(Debug, Parser)]
-#[command(name = "dlq")]
+#[command(name = "dlq", version)]
 #[command(about = "aws dead letter queue CLI client written in rust", long_about = None)]
 pub struct Cli {
     /// Use local development mode (test credentials + localhost:4566 endpoint)
@@ -137,6 +169,47 @@ enum Commands {
         url: String,
     },
 
+    /// Move messages from one queue to another (e.g. a DLQ back to its source queue)
+    ///
+    /// Each message is deleted from the source only after the destination accepts
+    /// it. Message attributes and FIFO MessageGroupIds are kept; FIFO destinations get
+    /// a new MessageDeduplicationId each run, so SQS doesn't drop redriven messages as
+    /// duplicates of their original send.
+    Redrive {
+        /// URL of the queue to move messages out of (usually the DLQ)
+        source_url: String,
+
+        /// URL of the queue to move messages into
+        destination_url: String,
+
+        /// Maximum number of messages to move (moves all if omitted)
+        #[arg(long, short = 'n')]
+        limit: Option<usize>,
+    },
+
+    /// Delete every message in a queue (cannot be undone)
+    Purge {
+        /// URL of the queue to purge
+        url: String,
+
+        /// Skip the confirmation prompt
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
+
+    /// Print a shell completion script
+    ///
+    /// Example: `dlq completions zsh > "${fpath[1]}/_dlq"`
+    Completions {
+        /// Shell to generate completions for
+        shell: clap_complete::Shell,
+    },
+
+    /// Print the man page (roff) to stdout
+    ///
+    /// Example: `dlq man > /usr/local/share/man/man1/dlq.1`
+    Man,
+
     /// Interactive message sending mode (reads from stdin)
     Send {
         /// The URL of your SQS queue to send messages to.
@@ -204,6 +277,19 @@ impl Cli {
     /// * `Ok(())` - Command completed successfully
     /// * `Err(anyhow::Error)` - An error occurred during execution
     pub async fn run(self) -> anyhow::Result<()> {
+        // Commands that don't talk to AWS
+        match &self.command {
+            Commands::Completions { shell } => {
+                clap_complete::generate(*shell, &mut Cli::command(), "dlq", &mut std::io::stdout());
+                return Ok(());
+            }
+            Commands::Man => {
+                clap_mangen::Man::new(Cli::command()).render(&mut std::io::stdout())?;
+                return Ok(());
+            }
+            _ => {}
+        }
+
         // Load AWS config once, based on global flags
         let aws_config = load_aws_config(self.local, self.endpoint.as_deref()).await;
         let dlq = DeadLetterQueue::from_config(aws_config.clone());
@@ -243,10 +329,51 @@ impl Cli {
                 }
             }
             Commands::Poll { url } => {
-                for message in dlq.poll(&url).await? {
-                    println!("{}", serde_json::to_string(&message)?);
+                // Print each batch as it arrives rather than after every receive.
+                dlq.poll_with(&url, |message| {
+                    println!(
+                        "{}",
+                        serde_json::to_string(&message).expect("MessageModel serializes")
+                    );
+                })
+                .await?;
+            }
+            Commands::Redrive {
+                source_url,
+                destination_url,
+                limit,
+            } => {
+                let summary = match dlq.redrive(&source_url, &destination_url, limit).await {
+                    Ok(summary) => summary,
+                    Err(dlq::Error::RedriveInterrupted { summary, source }) => {
+                        println!("Moved {} message(s) before stopping", summary.moved);
+                        let mut message =
+                            format!("redrive stopped: {:#}", anyhow::Error::from(*source));
+                        if let Some(details) = describe_redrive_leftovers(&summary, &source_url) {
+                            message = format!("{message}\n{details}");
+                        }
+                        anyhow::bail!(message);
+                    }
+                    Err(e) => return Err(e.into()),
+                };
+                println!("Moved {} message(s)", summary.moved);
+                if let Some(details) = describe_redrive_leftovers(&summary, &source_url) {
+                    if summary.is_complete() {
+                        // Only messages that stay hidden for a while: worth a warning.
+                        eprintln!("warning: {details}");
+                    } else {
+                        anyhow::bail!("redrive did not move every message:\n{details}");
+                    }
                 }
             }
+            Commands::Purge { url, yes } => {
+                if !yes {
+                    confirm_purge(&url)?;
+                }
+                dlq.purge(&url).await?;
+                println!("Purged {url}");
+            }
+            Commands::Completions { .. } | Commands::Man => unreachable!("handled above"),
             Commands::Send { url } => send::run(aws_config, &url).await,
             Commands::SendBatch {
                 job_id,
@@ -280,5 +407,89 @@ impl Cli {
         };
 
         Ok(())
+    }
+}
+
+/// Asks the user to type the queue name before purging. Refuses when stdin isn't
+/// a terminal, so scripts must pass `--yes` explicitly.
+fn confirm_purge(url: &str) -> anyhow::Result<()> {
+    let Some(name) = queue_name(url) else {
+        anyhow::bail!("can't tell the queue name from {url:?}; pass --yes to purge it anyway");
+    };
+    if !std::io::stdin().is_terminal() {
+        anyhow::bail!(
+            "refusing to purge {name} without confirmation; pass --yes to skip the prompt"
+        );
+    }
+
+    eprint!("This permanently deletes every message in {name}.\nType the queue name to confirm: ");
+    std::io::stderr().flush()?;
+    let mut answer = String::new();
+    std::io::stdin().lock().read_line(&mut answer)?;
+    if answer.trim() != name {
+        anyhow::bail!("confirmation did not match; nothing was purged");
+    }
+    Ok(())
+}
+
+/// Explains what a redrive left behind, by kind, so the user knows which messages
+/// are safe to redrive again. `None` if nothing was left behind.
+fn describe_redrive_leftovers(summary: &dlq::RedriveSummary, source_url: &str) -> Option<String> {
+    let mut lines = Vec::new();
+    if !summary.rejected.is_empty() {
+        lines.push(format!(
+            "  - {} message(s) were rejected by the destination ({}) and remain in {source_url}",
+            summary.rejected.len(),
+            summary.rejected_codes()
+        ));
+    }
+    if !summary.blocked_groups.is_empty() {
+        lines.push(format!(
+            "  - FIFO group(s) {} stopped at a rejected message; their later messages were \
+             not sent, to keep order, and remain in {source_url}",
+            summary.blocked_groups.join(", ")
+        ));
+    }
+    if !summary.not_deleted.is_empty() {
+        lines.push(format!(
+            "  - {} message(s) WERE delivered but could not be deleted from {source_url} ({}); \
+             redriving again will deliver them twice",
+            summary.not_deleted.len(),
+            summary.not_deleted_codes()
+        ));
+    }
+    if !summary.still_hidden.is_empty() {
+        lines.push(format!(
+            "  - {} message(s) could not be made visible again in {source_url}; \
+             they reappear within 15 minutes",
+            summary.still_hidden.len()
+        ));
+    }
+    (!lines.is_empty()).then(|| lines.join("\n"))
+}
+
+/// The queue name at the end of a queue URL, ignoring a trailing slash.
+fn queue_name(url: &str) -> Option<&str> {
+    url.trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .filter(|name| !name.is_empty() && !name.contains(':'))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::queue_name;
+
+    #[test]
+    fn queue_name_from_url() {
+        let url = "https://sqs.us-east-1.amazonaws.com/123456789012/prod-dlq";
+        assert_eq!(queue_name(url), Some("prod-dlq"));
+        // A trailing slash must not turn the name into "" (which an empty answer
+        // at the prompt would match).
+        assert_eq!(queue_name(&format!("{url}/")), Some("prod-dlq"));
+        assert_eq!(queue_name(&format!("{url}//")), Some("prod-dlq"));
+        assert_eq!(queue_name(""), None);
+        assert_eq!(queue_name("/"), None);
+        assert_eq!(queue_name("https://"), None);
     }
 }

@@ -1,0 +1,1432 @@
+//! Moving messages out of a dead letter queue.
+
+use std::collections::{HashMap, HashSet};
+use std::ops::Range;
+
+use aws_sdk_sqs::types::{
+    BatchResultErrorEntry, ChangeMessageVisibilityBatchRequestEntry,
+    DeleteMessageBatchRequestEntry, Message, MessageSystemAttributeName, QueueAttributeName,
+    SendMessageBatchRequestEntry,
+};
+
+use aws_sdk_sqs::operation::delete_message_batch::DeleteMessageBatchOutput;
+use aws_sdk_sqs::operation::send_message_batch::SendMessageBatchOutput;
+
+use crate::error::{BatchEntryFailure, Error, Result, summarize_codes};
+use crate::sqs::DeadLetterQueue;
+
+/// Seconds a received message stays hidden while it is being moved.
+const VISIBILITY_TIMEOUT: i32 = 60;
+
+/// Seconds a message that could not be moved is kept hidden, so the rest of the run
+/// never receives (and never resends) it. Released at the end of the run.
+const HOLD_SECONDS: i32 = 15 * 60;
+
+/// Long-poll wait per receive. Any non-zero wait makes SQS query all of its servers,
+/// so an empty response reliably means no messages are visible (short polling samples
+/// a subset and can come back empty while messages remain).
+const WAIT_TIME_SECONDS: i32 = 1;
+
+/// Payload budget per `SendMessageBatch` request. Kept at the historical 256 KiB batch
+/// limit so requests stay valid regardless of the queue's configured maximum.
+const MAX_BATCH_BYTES: usize = 256 * 1024;
+
+/// Outcome of [`DeadLetterQueue::redrive`].
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct RedriveSummary {
+    /// Messages sent to the destination and deleted from the source.
+    pub moved: usize,
+    /// Messages the destination rejected. They remain in the source queue.
+    pub rejected: Vec<RedriveFailure>,
+    /// Messages delivered to the destination that could not be deleted from the
+    /// source. They remain in the source too, so redriving again delivers them twice.
+    pub not_deleted: Vec<RedriveFailure>,
+    /// FIFO message groups (source is a FIFO queue) that stopped at a rejected message.
+    /// Later messages in these groups were not sent, to keep their order.
+    pub blocked_groups: Vec<String>,
+    /// IDs of messages that could not be made visible again at the end of the run.
+    /// They are still in the source and reappear within 15 minutes.
+    pub still_hidden: Vec<String>,
+}
+
+impl RedriveSummary {
+    /// Whether every message that was attempted moved successfully.
+    pub fn is_complete(&self) -> bool {
+        self.rejected.is_empty() && self.not_deleted.is_empty() && self.blocked_groups.is_empty()
+    }
+
+    /// Distinct SQS error codes of [`rejected`](Self::rejected) messages, comma-separated.
+    pub fn rejected_codes(&self) -> String {
+        summarize_codes(self.rejected.iter().map(|f| &f.error))
+    }
+
+    /// Distinct SQS error codes of [`not_deleted`](Self::not_deleted) messages,
+    /// comma-separated.
+    pub fn not_deleted_codes(&self) -> String {
+        summarize_codes(self.not_deleted.iter().map(|f| &f.error))
+    }
+}
+
+/// A message that could not be fully moved.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RedriveFailure {
+    /// SQS message ID in the source queue.
+    pub message_id: String,
+    /// The error SQS returned for this message.
+    pub error: BatchEntryFailure,
+}
+
+impl DeadLetterQueue {
+    /// Moves messages from `source_url` (usually a DLQ) to `destination_url`.
+    ///
+    /// Each message is sent with its body and message attributes, then deleted from
+    /// the source only once the destination has accepted it, so a failure never loses
+    /// messages (at worst one is duplicated). For FIFO destinations, the original
+    /// `MessageGroupId` is kept and each run uses a fresh `MessageDeduplicationId`, so
+    /// SQS never discards a redriven message as a duplicate of its original send.
+    ///
+    /// Messages that cannot be moved are kept hidden for the rest of the run and made
+    /// visible again at the end, so they are attempted once per run and the run ends
+    /// when a long-poll receive finds nothing else, or `limit` messages have moved.
+    /// For FIFO sources, a rejected message also stops the rest of its group (see
+    /// [`RedriveSummary::blocked_groups`]). Batches from a FIFO source never hold two
+    /// messages from the same group, so nothing after a rejected message is sent.
+    ///
+    /// AWS also offers server-side redrive (`StartMessageMoveTask`) for queues with a
+    /// redrive policy; this method works for any pair of queues.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::RedriveToSameQueue`] if both URLs identify the same queue
+    /// (that would loop forever). If a request fails as a whole part way through,
+    /// returns [`Error::RedriveInterrupted`] with the summary so far, including any
+    /// messages that were delivered but not deleted. Messages that fail individually
+    /// are reported in the summary instead.
+    pub async fn redrive(
+        &self,
+        source_url: &str,
+        destination_url: &str,
+        limit: Option<usize>,
+    ) -> Result<RedriveSummary> {
+        if self.is_same_queue(source_url, destination_url).await? {
+            return Err(Error::RedriveToSameQueue {
+                queue_url: source_url.to_string(),
+            });
+        }
+
+        let mut run = Redrive {
+            dlq: self,
+            source_url,
+            destination_url,
+            source_fifo: source_url.ends_with(".fifo"),
+            destination_fifo: destination_url.ends_with(".fifo"),
+            dedup_suffix: run_nonce(),
+            summary: RedriveSummary::default(),
+            held: HashMap::new(),
+        };
+        let result = run.run(limit).await;
+
+        // Always make held messages visible again, even if the run failed part way.
+        run.release_held().await;
+        match result {
+            Ok(()) => Ok(run.summary),
+            Err(source) => Err(Error::RedriveInterrupted {
+                summary: Box::new(run.summary),
+                source: Box::new(source),
+            }),
+        }
+    }
+
+    /// Whether two queue URLs identify the same queue. URLs naming different queues are
+    /// different; otherwise (e.g. different hosts or path forms for the same name) the
+    /// queue ARNs are compared.
+    async fn is_same_queue(&self, a: &str, b: &str) -> Result<bool> {
+        match same_queue_by_url(a, b) {
+            Some(same) => Ok(same),
+            None => {
+                let (arn_a, arn_b) = tokio::try_join!(self.queue_arn(a), self.queue_arn(b))?;
+                Ok(arn_a == arn_b)
+            }
+        }
+    }
+
+    async fn queue_arn(&self, queue_url: &str) -> Result<String> {
+        self.client
+            .get_queue_attributes()
+            .queue_url(queue_url)
+            .attribute_names(QueueAttributeName::QueueArn)
+            .send()
+            .await
+            .map_err(|e| Error::QueueAttributes {
+                queue_url: queue_url.to_string(),
+                source: Box::new(e),
+            })?
+            .attributes
+            .and_then(|mut a| a.remove(&QueueAttributeName::QueueArn))
+            .ok_or_else(|| Error::MissingQueueArn {
+                queue_url: queue_url.to_string(),
+            })
+    }
+}
+
+/// State for one redrive run.
+struct Redrive<'a> {
+    dlq: &'a DeadLetterQueue,
+    source_url: &'a str,
+    destination_url: &'a str,
+    source_fifo: bool,
+    destination_fifo: bool,
+    dedup_suffix: String,
+    summary: RedriveSummary,
+    /// Messages kept hidden for the rest of the run: message ID -> latest receipt handle.
+    held: HashMap<String, String>,
+}
+
+impl Redrive<'_> {
+    async fn run(&mut self, limit: Option<usize>) -> Result<()> {
+        loop {
+            let remaining = limit.map_or(10, |l| l.saturating_sub(self.summary.moved).min(10));
+            if remaining == 0 {
+                return Ok(());
+            }
+
+            let messages = self.receive(remaining).await?;
+            if messages.is_empty() {
+                return Ok(());
+            }
+
+            // A held message can come back if the run outlasts HOLD_SECONDS; hide it
+            // again instead of resending it.
+            let (again, fresh): (Vec<_>, Vec<_>) = messages
+                .into_iter()
+                .partition(|m| self.held.contains_key(message_id(m)));
+            self.hold(&again).await?;
+
+            for chunk in chunk_messages(&fresh, MAX_BATCH_BYTES, self.source_fifo) {
+                self.move_chunk(&fresh[chunk]).await?;
+            }
+        }
+    }
+
+    async fn receive(&self, max: usize) -> Result<Vec<Message>> {
+        Ok(self
+            .dlq
+            .client
+            .receive_message()
+            .queue_url(self.source_url)
+            .max_number_of_messages(max as i32)
+            .visibility_timeout(VISIBILITY_TIMEOUT)
+            .wait_time_seconds(WAIT_TIME_SECONDS)
+            .message_attribute_names("All")
+            .message_system_attribute_names(MessageSystemAttributeName::MessageGroupId)
+            .send()
+            .await
+            .map_err(|e| Error::Receive {
+                queue_url: self.source_url.to_string(),
+                source: Box::new(e),
+            })?
+            .messages
+            .unwrap_or_default())
+    }
+
+    /// Sends one size-bounded chunk, then deletes what the destination accepted.
+    async fn move_chunk(&mut self, chunk: &[Message]) -> Result<()> {
+        // FIFO source: messages after a rejected one in the same group are not sent,
+        // so the group's order is kept. They are held and released at the end.
+        let (blocked, to_send): (Vec<&Message>, Vec<&Message>) = chunk
+            .iter()
+            .partition(|m| self.source_fifo && self.is_blocked(m));
+        self.hold(blocked).await?;
+        if to_send.is_empty() {
+            return Ok(());
+        }
+
+        let entries = to_send
+            .iter()
+            .enumerate()
+            .map(|(i, m)| send_entry(i, m, self.destination_fifo, &self.dedup_suffix))
+            .collect::<Result<Vec<_>, _>>()?;
+        let SendMessageBatchOutput {
+            successful, failed, ..
+        } = self
+            .dlq
+            .client
+            .send_message_batch()
+            .queue_url(self.destination_url)
+            .set_entries(Some(entries))
+            .send()
+            .await
+            .map_err(|e| Error::Send {
+                queue_url: self.destination_url.to_string(),
+                source: Box::new(e),
+            })?;
+
+        let successful: HashSet<&str> = successful.iter().map(|s| s.id.as_str()).collect();
+        let (accepted, rejected) = classify(&to_send, &successful, failed);
+        for (message, failure) in &rejected {
+            if self.source_fifo
+                && let Some(group) = group_id(message)
+                && !self.summary.blocked_groups.iter().any(|g| g == group)
+            {
+                self.summary.blocked_groups.push(group.to_string());
+            }
+            self.summary.rejected.push(RedriveFailure {
+                message_id: message_id(message).to_string(),
+                error: failure.clone(),
+            });
+        }
+        self.hold(rejected.iter().map(|(m, _)| *m)).await?;
+
+        self.delete(&accepted).await
+    }
+
+    async fn delete(&mut self, messages: &[&Message]) -> Result<()> {
+        if messages.is_empty() {
+            return Ok(());
+        }
+        let entries = messages
+            .iter()
+            .enumerate()
+            .map(|(i, m)| {
+                DeleteMessageBatchRequestEntry::builder()
+                    .id(i.to_string())
+                    .receipt_handle(m.receipt_handle().unwrap_or_default())
+                    .build()
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let output = self
+            .dlq
+            .client
+            .delete_message_batch()
+            .queue_url(self.source_url)
+            .set_entries(Some(entries))
+            .send()
+            .await;
+        let DeleteMessageBatchOutput {
+            successful, failed, ..
+        } = match output {
+            Ok(output) => output,
+            Err(e) => {
+                // Every message here was delivered: report and hold them all before
+                // stopping, so the caller knows a re-run would duplicate them.
+                let error = e.to_string();
+                for (i, message) in messages.iter().enumerate() {
+                    self.summary.not_deleted.push(RedriveFailure {
+                        message_id: message_id(message).to_string(),
+                        error: BatchEntryFailure {
+                            index: i,
+                            code: "DeleteRequestFailed".to_string(),
+                            message: Some(error.clone()),
+                            sender_fault: false,
+                        },
+                    });
+                }
+                // The delete error is the one worth reporting, so a hold failure here
+                // is ignored; held messages are still released at the end.
+                let _ = self.hold(messages.iter().copied()).await;
+                return Err(Error::DeleteBatch {
+                    queue_url: self.source_url.to_string(),
+                    source: Box::new(e),
+                });
+            }
+        };
+
+        let deleted: HashSet<&str> = successful.iter().map(|s| s.id.as_str()).collect();
+        self.summary.moved += deleted.len();
+
+        // Delivered but still in the source: hold them so this run never sends them
+        // again, and report them so the caller knows a re-run would duplicate them.
+        let (_, not_deleted) = classify(messages, &deleted, failed);
+        for (message, failure) in &not_deleted {
+            self.summary.not_deleted.push(RedriveFailure {
+                message_id: message_id(message).to_string(),
+                error: failure.clone(),
+            });
+        }
+        self.hold(not_deleted.iter().map(|(m, _)| *m)).await
+    }
+
+    fn is_blocked(&self, message: &Message) -> bool {
+        group_id(message).is_some_and(|g| self.summary.blocked_groups.iter().any(|b| b == g))
+    }
+
+    /// Keeps messages hidden for HOLD_SECONDS and remembers them for release.
+    ///
+    /// Fails if any message can't be hidden: it would keep coming back, and the run
+    /// only ends once receives come back empty.
+    async fn hold<'m>(&mut self, messages: impl IntoIterator<Item = &'m Message>) -> Result<()> {
+        let messages: Vec<&Message> = messages.into_iter().collect();
+        for m in &messages {
+            self.held.insert(
+                message_id(m).to_string(),
+                m.receipt_handle().unwrap_or_default().to_string(),
+            );
+        }
+        let handles: Vec<&str> = messages
+            .iter()
+            .map(|m| m.receipt_handle().unwrap_or_default())
+            .collect();
+        let failed = self.change_visibility(&handles, HOLD_SECONDS).await?;
+        if failed.is_empty() {
+            Ok(())
+        } else {
+            Err(Error::PartialVisibilityChange {
+                queue_url: self.source_url.to_string(),
+                failed: failed.into_iter().map(|(_, f)| f).collect(),
+            })
+        }
+    }
+
+    /// Makes every held message visible again (best effort). Messages that stay
+    /// hidden are listed in [`RedriveSummary::still_hidden`].
+    async fn release_held(&mut self) {
+        let held: Vec<(String, String)> = self.held.drain().collect();
+        let handles: Vec<&str> = held.iter().map(|(_, h)| h.as_str()).collect();
+        match self.change_visibility(&handles, 0).await {
+            Ok(failed) => self
+                .summary
+                .still_hidden
+                .extend(failed.into_iter().map(|(i, _)| held[i].0.clone())),
+            Err(_) => self
+                .summary
+                .still_hidden
+                .extend(held.into_iter().map(|(id, _)| id)),
+        }
+    }
+
+    /// Changes visibility for every handle. Returns the entries SQS rejected, by index
+    /// into `handles`; errors only if a whole request fails.
+    async fn change_visibility(
+        &self,
+        handles: &[&str],
+        seconds: i32,
+    ) -> Result<Vec<(usize, BatchEntryFailure)>> {
+        let mut failures = Vec::new();
+        for (batch_index, batch) in handles.chunks(10).enumerate() {
+            let entries = batch
+                .iter()
+                .enumerate()
+                .map(|(i, handle)| {
+                    ChangeMessageVisibilityBatchRequestEntry::builder()
+                        .id(i.to_string())
+                        .receipt_handle(*handle)
+                        .visibility_timeout(seconds)
+                        .build()
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let output = self
+                .dlq
+                .client
+                .change_message_visibility_batch()
+                .queue_url(self.source_url)
+                .set_entries(Some(entries))
+                .send()
+                .await
+                .map_err(|e| Error::ChangeVisibility {
+                    queue_url: self.source_url.to_string(),
+                    source: Box::new(e),
+                })?;
+            failures.extend(output.failed.into_iter().map(|f| {
+                let failure = BatchEntryFailure::from(f);
+                (batch_index * 10 + failure.index, failure)
+            }));
+        }
+        Ok(failures)
+    }
+}
+
+/// Splits a batch response into accepted messages and rejected ones with their error.
+/// Entry IDs are indexes into `messages`. A message SQS reported as neither accepted
+/// nor failed is treated as rejected, so it is never deleted.
+fn classify<'m>(
+    messages: &[&'m Message],
+    successful: &HashSet<&str>,
+    failed: Vec<BatchResultErrorEntry>,
+) -> (Vec<&'m Message>, Vec<(&'m Message, BatchEntryFailure)>) {
+    let mut failures: HashMap<String, BatchEntryFailure> = failed
+        .into_iter()
+        .map(|f| (f.id.clone(), BatchEntryFailure::from(f)))
+        .collect();
+
+    let mut accepted = Vec::new();
+    let mut rejected = Vec::new();
+    for (i, message) in messages.iter().enumerate() {
+        let id = i.to_string();
+        if successful.contains(id.as_str()) {
+            accepted.push(*message);
+        } else {
+            let failure = failures.remove(&id).unwrap_or_else(|| BatchEntryFailure {
+                index: i,
+                code: "MissingFromResponse".to_string(),
+                message: Some("SQS did not report a result for this entry".to_string()),
+                sender_fault: false,
+            });
+            rejected.push((*message, failure));
+        }
+    }
+    (accepted, rejected)
+}
+
+/// Splits messages into consecutive ranges whose estimated payload stays within
+/// `max_bytes` (and at most 10 entries). A single oversized message gets its own range.
+///
+/// With `one_per_group`, a range never holds two messages from the same FIFO group, so
+/// if one is rejected, no later message of its group has been sent in the same request.
+fn chunk_messages(
+    messages: &[Message],
+    max_bytes: usize,
+    one_per_group: bool,
+) -> Vec<Range<usize>> {
+    let mut chunks = Vec::new();
+    let mut start = 0;
+    let mut bytes = 0;
+    let mut groups: HashSet<&str> = HashSet::new();
+    for (i, message) in messages.iter().enumerate() {
+        let size = payload_size(message);
+        let group = group_id(message).filter(|_| one_per_group);
+        let repeats_group = group.is_some_and(|g| groups.contains(g));
+        if i > start && (bytes + size > max_bytes || i - start == 10 || repeats_group) {
+            chunks.push(start..i);
+            start = i;
+            bytes = 0;
+            groups.clear();
+        }
+        bytes += size;
+        groups.extend(group);
+    }
+    if start < messages.len() {
+        chunks.push(start..messages.len());
+    }
+    chunks
+}
+
+/// SQS counts the body plus each message attribute's name, type, and value.
+fn payload_size(message: &Message) -> usize {
+    let attributes: usize = message
+        .message_attributes()
+        .map(|attrs| {
+            attrs
+                .iter()
+                .map(|(name, value)| {
+                    name.len()
+                        + value.data_type().len()
+                        + value.string_value().map_or(0, str::len)
+                        + value.binary_value().map_or(0, |b| b.as_ref().len())
+                })
+                .sum()
+        })
+        .unwrap_or(0);
+    message.body().map_or(0, str::len) + attributes
+}
+
+/// Decides from the URLs alone when possible: `Some(false)` when they name different
+/// queues, `Some(true)` for the same URL, and `None` when the same queue name is reached
+/// another way (e.g. `sqs.us-east-1.amazonaws.com` vs `queue.amazonaws.com`, or
+/// ElasticMQ's `/queue/<name>` form), which needs an ARN comparison.
+fn same_queue_by_url(a: &str, b: &str) -> Option<bool> {
+    fn split(url: &str) -> (String, &str) {
+        let rest = url.split_once("://").map_or(url, |(_, rest)| rest);
+        let (host, path) = rest.split_once('/').unwrap_or((rest, ""));
+        (host.to_ascii_lowercase(), path.trim_end_matches('/'))
+    }
+    fn name(path: &str) -> &str {
+        path.rsplit('/').next().unwrap_or(path)
+    }
+    let (host_a, path_a) = split(a);
+    let (host_b, path_b) = split(b);
+    if name(path_a) != name(path_b) {
+        Some(false)
+    } else if host_a == host_b && path_a == path_b {
+        Some(true)
+    } else {
+        None
+    }
+}
+
+/// A suffix unique to this run, so FIFO deduplication IDs never match an earlier send.
+fn run_nonce() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    format!("{nanos:x}")
+}
+
+fn message_id(message: &Message) -> &str {
+    message.message_id().unwrap_or_default()
+}
+
+fn group_id(message: &Message) -> Option<&str> {
+    message
+        .attributes()?
+        .get(&MessageSystemAttributeName::MessageGroupId)
+        .map(String::as_str)
+}
+
+fn send_entry(
+    index: usize,
+    message: &Message,
+    fifo: bool,
+    dedup_suffix: &str,
+) -> Result<SendMessageBatchRequestEntry, aws_sdk_sqs::error::BuildError> {
+    let mut entry = SendMessageBatchRequestEntry::builder()
+        .id(index.to_string())
+        .message_body(message.body().unwrap_or_default())
+        .set_message_attributes(message.message_attributes.clone());
+
+    if fifo {
+        // A new deduplication ID per run: reusing the original one would make SQS
+        // accept-and-drop the message if it was first sent less than 5 minutes ago.
+        entry = entry
+            .message_group_id(group_id(message).unwrap_or("dlq-redrive"))
+            .message_deduplication_id(format!("{}-{dedup_suffix}", message_id(message)));
+    }
+
+    entry.build()
+}
+
+#[cfg(test)]
+mod unit_tests {
+    use std::collections::HashSet;
+
+    use aws_sdk_sqs::types::{BatchResultErrorEntry, Message, MessageSystemAttributeName};
+
+    use super::*;
+
+    fn message(id: &str, body_len: usize) -> Message {
+        Message::builder()
+            .message_id(id)
+            .receipt_handle(format!("handle-{id}"))
+            .body("x".repeat(body_len))
+            .build()
+    }
+
+    #[test]
+    fn chunks_respect_size_and_count() {
+        let sizes = [100, 100, 300, 50, 50, 400, 600];
+        let messages: Vec<_> = sizes
+            .iter()
+            .enumerate()
+            .map(|(i, len)| message(&i.to_string(), *len))
+            .collect();
+        // 500-byte budget; the 600-byte message exceeds it on its own.
+        assert_eq!(
+            chunk_messages(&messages, 500, false),
+            vec![0..3, 3..6, 6..7]
+        );
+
+        let many: Vec<_> = (0..25).map(|i| message(&i.to_string(), 1)).collect();
+        assert_eq!(
+            chunk_messages(&many, usize::MAX, false),
+            vec![0..10, 10..20, 20..25]
+        );
+        assert!(chunk_messages(&[], 500, false).is_empty());
+    }
+
+    #[test]
+    fn fifo_chunks_hold_one_message_per_group() {
+        let grouped = |id: &str, group: &str| {
+            Message::builder()
+                .message_id(id)
+                .body("x")
+                .attributes(MessageSystemAttributeName::MessageGroupId, group)
+                .build()
+        };
+        let messages = [
+            grouped("a1", "a"),
+            grouped("b1", "b"),
+            grouped("a2", "a"),
+            grouped("c1", "c"),
+            grouped("a3", "a"),
+        ];
+        assert_eq!(
+            chunk_messages(&messages, usize::MAX, true),
+            vec![0..2, 2..4, 4..5]
+        );
+        // Without the FIFO rule, everything fits in one request.
+        assert_eq!(chunk_messages(&messages, usize::MAX, false), vec![0..5]);
+    }
+
+    #[test]
+    fn same_queue_decided_from_urls_when_possible() {
+        let q = "https://sqs.us-east-1.amazonaws.com/123456789012/orders";
+        assert_eq!(same_queue_by_url(q, q), Some(true));
+        assert_eq!(
+            same_queue_by_url(
+                q,
+                "HTTPS://SQS.us-east-1.amazonaws.com/123456789012/orders/"
+            ),
+            Some(true)
+        );
+        assert_eq!(
+            same_queue_by_url(
+                q,
+                "https://sqs.us-east-1.amazonaws.com/123456789012/orders-dlq"
+            ),
+            Some(false)
+        );
+        // Same name through another path form (ElasticMQ): needs an ARN lookup.
+        assert_eq!(
+            same_queue_by_url(
+                "http://localhost:4566/queue/orders",
+                "http://localhost:4566/000000000000/orders"
+            ),
+            None
+        );
+        // Same path, different host: needs an ARN lookup.
+        assert_eq!(
+            same_queue_by_url(q, "https://queue.amazonaws.com/123456789012/orders"),
+            None
+        );
+    }
+
+    #[test]
+    fn classify_splits_accepted_and_rejected() {
+        let messages = [message("a", 1), message("b", 1), message("c", 1)];
+        let refs: Vec<&Message> = messages.iter().collect();
+        let successful: HashSet<&str> = ["0"].into();
+        let failed = vec![
+            BatchResultErrorEntry::builder()
+                .id("1")
+                .code("InvalidParameterValue")
+                .sender_fault(true)
+                .build()
+                .unwrap(),
+        ];
+
+        let (accepted, rejected) = classify(&refs, &successful, failed);
+        assert_eq!(accepted.len(), 1);
+        assert_eq!(accepted[0].message_id(), Some("a"));
+        // "c" is missing from the response entirely: never treat it as accepted.
+        let codes: Vec<_> = rejected
+            .iter()
+            .map(|(m, f)| (m.message_id().unwrap(), f.code.as_str()))
+            .collect();
+        assert_eq!(
+            codes,
+            [("b", "InvalidParameterValue"), ("c", "MissingFromResponse")]
+        );
+    }
+
+    #[test]
+    fn fifo_entries_get_fresh_dedup_ids_and_keep_group() {
+        let original = Message::builder()
+            .message_id("m1")
+            .body("hi")
+            .attributes(MessageSystemAttributeName::MessageGroupId, "g1")
+            .attributes(MessageSystemAttributeName::MessageDeduplicationId, "orig")
+            .build();
+
+        let first = send_entry(0, &original, true, "run1").unwrap();
+        let second = send_entry(0, &original, true, "run2").unwrap();
+        assert_eq!(first.message_group_id(), Some("g1"));
+        assert_ne!(first.message_deduplication_id(), Some("orig"));
+        assert_ne!(
+            first.message_deduplication_id(),
+            second.message_deduplication_id()
+        );
+
+        let standard = send_entry(0, &original, false, "run1").unwrap();
+        assert_eq!(standard.message_group_id(), None);
+        assert_eq!(standard.message_deduplication_id(), None);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use aws_sdk_sqs::types::{MessageAttributeValue, QueueAttributeName};
+
+    use crate::test_utils::SqsTestEnv;
+
+    async fn create_fifo_queue(env: &SqsTestEnv, prefix: &str) -> String {
+        env.client()
+            .create_queue()
+            .queue_name(format!(
+                "{}.fifo",
+                crate::test_utils::unique_queue_name(prefix)
+            ))
+            .attributes(QueueAttributeName::FifoQueue, "true")
+            .send()
+            .await
+            .unwrap()
+            .queue_url
+            .unwrap()
+    }
+
+    async fn send_fifo(env: &SqsTestEnv, queue_url: &str, body: &str, group: &str, dedup: &str) {
+        env.client()
+            .send_message()
+            .queue_url(queue_url)
+            .message_body(body)
+            .message_group_id(group)
+            .message_deduplication_id(dedup)
+            .send()
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_fifo_redrive_is_not_dropped_as_duplicate() {
+        // A message first sent with dedup ID "d1" moves to the DLQ and is redriven
+        // within SQS's 5-minute dedup window. Reusing "d1" would be accepted-and-dropped.
+        let env = SqsTestEnv::start().await;
+        let source = create_fifo_queue(&env, "dedup-src").await;
+        let destination = create_fifo_queue(&env, "dedup-dst").await;
+        send_fifo(&env, &destination, "original", "g", "d1").await;
+        env.receive_bodies(&destination, 1).await; // consumed and failed processing...
+        send_fifo(&env, &source, "original", "g", "d1").await; // ...and ended up in the DLQ
+
+        let summary = env
+            .dlq()
+            .redrive(&source, &destination, None)
+            .await
+            .unwrap();
+        assert_eq!(summary.moved, 1);
+        // Visible again after the first receive's visibility timeout would hide it, so
+        // look for the redriven copy among everything currently in the queue.
+        let attributes = env
+            .client()
+            .get_queue_attributes()
+            .queue_url(&destination)
+            .attribute_names(QueueAttributeName::ApproximateNumberOfMessages)
+            .attribute_names(QueueAttributeName::ApproximateNumberOfMessagesNotVisible)
+            .send()
+            .await
+            .unwrap()
+            .attributes
+            .unwrap_or_default();
+        let total: usize = attributes
+            .values()
+            .map(|v| v.parse::<usize>().unwrap())
+            .sum();
+        assert_eq!(total, 2, "redriven message was dropped as a duplicate");
+    }
+
+    #[tokio::test]
+    async fn test_redrive_splits_large_messages_across_batches() {
+        let env = SqsTestEnv::start().await;
+        let source = env.create_queue("large-src").await;
+        let destination = env.create_queue("large-dst").await;
+
+        // 10 x 100 KiB is well over one batch's 256 KiB budget.
+        let messages: Vec<String> = (0..10)
+            .map(|i| format!("{i}{}", "x".repeat(100 * 1024)))
+            .collect();
+        for message in &messages {
+            env.dlq().send_batch(&source, &[message]).await.unwrap();
+        }
+
+        let summary = env
+            .dlq()
+            .redrive(&source, &destination, None)
+            .await
+            .unwrap();
+        assert_eq!(summary.moved, 10);
+        assert!(summary.is_complete(), "{summary:?}");
+        assert_eq!(env.receive_bodies(&destination, 10).await.len(), 10);
+    }
+
+    #[tokio::test]
+    async fn test_redrive_fifo_source_moves_every_group_in_order() {
+        let env = SqsTestEnv::start().await;
+        let source = create_fifo_queue(&env, "groups-src").await;
+        let destination = create_fifo_queue(&env, "groups-dst").await;
+        for i in 0..6 {
+            for group in ["a", "b"] {
+                send_fifo(
+                    &env,
+                    &source,
+                    &format!("{group}{i}"),
+                    group,
+                    &format!("{group}{i}"),
+                )
+                .await;
+            }
+        }
+
+        let summary = env
+            .dlq()
+            .redrive(&source, &destination, None)
+            .await
+            .unwrap();
+        assert_eq!(summary.moved, 12);
+        assert!(summary.is_complete(), "{summary:?}");
+
+        // Delete as we read: FIFO queues hold back a group while earlier messages
+        // from it are still in flight.
+        let mut received = Vec::new();
+        while received.len() < 12 {
+            let messages = env
+                .client()
+                .receive_message()
+                .queue_url(&destination)
+                .max_number_of_messages(10)
+                .wait_time_seconds(1)
+                .send()
+                .await
+                .unwrap()
+                .messages
+                .unwrap_or_default();
+            assert!(!messages.is_empty(), "only got {received:?}");
+            for m in messages {
+                env.dlq()
+                    .delete(&destination, m.receipt_handle().unwrap())
+                    .await
+                    .unwrap();
+                received.push(m.body.unwrap());
+            }
+        }
+        for group in ["a", "b"] {
+            let order: Vec<_> = received.iter().filter(|b| b.starts_with(group)).collect();
+            let expected: Vec<_> = (0..6).map(|i| format!("{group}{i}")).collect();
+            assert_eq!(order, expected.iter().collect::<Vec<_>>());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_redrive_moves_all_messages() {
+        let env = SqsTestEnv::start().await;
+        let dlq_url = env.create_queue("redrive-src").await;
+        let target_url = env.create_queue("redrive-dst").await;
+        let dlq = env.dlq();
+
+        let messages: Vec<String> = (0..25).map(|i| format!("m{i}")).collect();
+        for batch in messages.chunks(10) {
+            dlq.send_batch(&dlq_url, batch).await.unwrap();
+        }
+
+        let summary = dlq.redrive(&dlq_url, &target_url, None).await.unwrap();
+        assert_eq!(summary.moved, 25);
+        assert!(summary.is_complete(), "{summary:?}");
+
+        let mut moved = env.receive_bodies(&target_url, 25).await;
+        moved.sort();
+        let mut expected = messages.clone();
+        expected.sort();
+        assert_eq!(moved, expected);
+        assert!(env.receive_bodies(&dlq_url, 1).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_redrive_respects_limit_and_keeps_attributes() {
+        let env = SqsTestEnv::start().await;
+        let dlq_url = env.create_queue("redrive-limit-src").await;
+        let target_url = env.create_queue("redrive-limit-dst").await;
+
+        for i in 0..5 {
+            env.client()
+                .send_message()
+                .queue_url(&dlq_url)
+                .message_body(format!("m{i}"))
+                .message_attributes(
+                    "origin",
+                    MessageAttributeValue::builder()
+                        .data_type("String")
+                        .string_value("orders")
+                        .build()
+                        .unwrap(),
+                )
+                .send()
+                .await
+                .unwrap();
+        }
+
+        let summary = env
+            .dlq()
+            .redrive(&dlq_url, &target_url, Some(3))
+            .await
+            .unwrap();
+        assert_eq!(summary.moved, 3);
+
+        let received = env
+            .client()
+            .receive_message()
+            .queue_url(&target_url)
+            .max_number_of_messages(10)
+            .message_attribute_names("All")
+            .send()
+            .await
+            .unwrap()
+            .messages
+            .unwrap_or_default();
+        assert_eq!(received.len(), 3);
+        for m in &received {
+            let origin = m.message_attributes().and_then(|a| a.get("origin"));
+            assert_eq!(origin.and_then(|v| v.string_value()), Some("orders"));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_redrive_to_fifo_queue() {
+        let env = SqsTestEnv::start().await;
+        let dlq_url = env.create_queue("redrive-fifo-src").await;
+        let target_url = env
+            .client()
+            .create_queue()
+            .queue_name(format!(
+                "{}.fifo",
+                crate::test_utils::unique_queue_name("redrive-fifo-dst")
+            ))
+            .attributes(QueueAttributeName::FifoQueue, "true")
+            .send()
+            .await
+            .unwrap()
+            .queue_url
+            .unwrap();
+
+        env.dlq().send_batch(&dlq_url, &["a", "b"]).await.unwrap();
+
+        let summary = env
+            .dlq()
+            .redrive(&dlq_url, &target_url, None)
+            .await
+            .unwrap();
+        assert_eq!(summary.moved, 2);
+        assert_eq!(env.receive_bodies(&target_url, 2).await.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_redrive_to_same_queue_is_rejected() {
+        let env = SqsTestEnv::start().await;
+        let queue_url = env.create_queue("redrive-self").await;
+        env.dlq().send_batch(&queue_url, &["a"]).await.unwrap();
+
+        // A different but equivalent URL for the same queue is still caught.
+        let alias = queue_url.replace("127.0.0.1", "localhost");
+        // ElasticMQ also serves the same queue at `/queue/<name>`.
+        let path_alias = queue_url.replace("/000000000000/", "/queue/");
+        for destination in [&queue_url, &alias, &path_alias] {
+            let result = env.dlq().redrive(&queue_url, destination, None).await;
+            assert!(
+                matches!(result, Err(crate::Error::RedriveToSameQueue { .. })),
+                "{destination}: {result:?}"
+            );
+        }
+        assert_eq!(env.receive_bodies(&queue_url, 1).await, ["a"]);
+    }
+
+    #[tokio::test]
+    async fn test_purge_empties_queue() {
+        let env = SqsTestEnv::start().await;
+        let queue_url = env.create_queue("purge").await;
+        env.dlq()
+            .send_batch(&queue_url, &["a", "b", "c"])
+            .await
+            .unwrap();
+
+        env.dlq().purge(&queue_url).await.unwrap();
+        assert!(env.receive_bodies(&queue_url, 1).await.is_empty());
+    }
+}
+
+/// Paths ElasticMQ can't reproduce (the destination rejecting individual messages,
+/// deletes failing, errors mid-run), driven through the real SDK client with scripted
+/// SQS responses. These clients have no `GetQueueAttributes` rule, so every test also
+/// checks that queues with different URLs are compared without an ARN lookup.
+#[cfg(test)]
+mod mock_tests {
+    use std::collections::{HashSet, VecDeque};
+    use std::sync::{Arc, Mutex};
+
+    use aws_sdk_sqs::Client;
+    use aws_sdk_sqs::operation::change_message_visibility_batch::ChangeMessageVisibilityBatchOutput;
+    use aws_sdk_sqs::operation::delete_message_batch::{
+        DeleteMessageBatchError, DeleteMessageBatchOutput,
+    };
+    use aws_sdk_sqs::operation::receive_message::{ReceiveMessageError, ReceiveMessageOutput};
+    use aws_sdk_sqs::operation::send_message_batch::SendMessageBatchOutput;
+    use aws_sdk_sqs::types::error::QueueDoesNotExist;
+    use aws_sdk_sqs::types::{
+        BatchResultErrorEntry, ChangeMessageVisibilityBatchResultEntry,
+        DeleteMessageBatchResultEntry, Message, MessageSystemAttributeName,
+        SendMessageBatchResultEntry,
+    };
+    use aws_smithy_mocks::{MockResponse, RuleMode, mock, mock_client};
+
+    use crate::{DeadLetterQueue, Error};
+
+    const SOURCE: &str = "https://sqs.us-east-1.amazonaws.com/123456789012/orders-dlq";
+    const DESTINATION: &str = "https://sqs.us-east-1.amazonaws.com/123456789012/orders";
+
+    /// Scripted SQS: receives come from `receives` (then empty); the destination rejects
+    /// `reject` bodies; deletes fail for `undeletable` receipt handles, or entirely with
+    /// `delete_request_fails`; visibility changes fail for `(handle, seconds)` entries
+    /// in `visibility_rejects`.
+    #[derive(Default)]
+    struct Fake {
+        receives: Mutex<VecDeque<Option<Vec<Message>>>>,
+        reject: HashSet<&'static str>,
+        undeletable: HashSet<&'static str>,
+        delete_request_fails: bool,
+        visibility_rejects: HashSet<(&'static str, i32)>,
+        /// Bodies of each SendMessageBatch request.
+        sent: Mutex<Vec<Vec<String>>>,
+        /// (receipt handle, visibility timeout) of each visibility change.
+        visibility: Mutex<Vec<(String, i32)>>,
+    }
+
+    impl Fake {
+        fn dlq(self: &Arc<Self>) -> DeadLetterQueue {
+            let fake = self.clone();
+            let receive =
+                mock!(Client::receive_message).then_compute_response(move |_| {
+                    match fake.receives.lock().unwrap().pop_front() {
+                        Some(Some(messages)) => MockResponse::Output(
+                            ReceiveMessageOutput::builder()
+                                .set_messages(Some(messages))
+                                .build(),
+                        ),
+                        Some(None) => MockResponse::Error(ReceiveMessageError::QueueDoesNotExist(
+                            QueueDoesNotExist::builder().build(),
+                        )),
+                        None => MockResponse::Output(ReceiveMessageOutput::builder().build()),
+                    }
+                });
+
+            let fake = self.clone();
+            let send = mock!(Client::send_message_batch).then_compute_output(move |input| {
+                let entries = input.entries();
+                fake.sent.lock().unwrap().push(
+                    entries
+                        .iter()
+                        .map(|e| e.message_body().to_string())
+                        .collect(),
+                );
+                let (rejected, accepted): (Vec<_>, Vec<_>) = entries
+                    .iter()
+                    .partition(|e| fake.reject.contains(e.message_body()));
+                SendMessageBatchOutput::builder()
+                    .set_successful(Some(
+                        accepted
+                            .iter()
+                            .map(|e| {
+                                SendMessageBatchResultEntry::builder()
+                                    .id(e.id())
+                                    .message_id("new-id")
+                                    .md5_of_message_body("md5")
+                                    .build()
+                                    .unwrap()
+                            })
+                            .collect(),
+                    ))
+                    .set_failed(Some(
+                        rejected
+                            .iter()
+                            .map(|e| failure(e.id(), "InvalidParameterValue"))
+                            .collect(),
+                    ))
+                    .build()
+                    .unwrap()
+            });
+
+            let fake = self.clone();
+            let delete = mock!(Client::delete_message_batch).then_compute_response(move |input| {
+                if fake.delete_request_fails {
+                    return MockResponse::Error(DeleteMessageBatchError::unhandled(
+                        "simulated throttling",
+                    ));
+                }
+                let (failed, ok): (Vec<_>, Vec<_>) = input
+                    .entries()
+                    .iter()
+                    .partition(|e| fake.undeletable.contains(e.receipt_handle()));
+                MockResponse::Output(
+                    DeleteMessageBatchOutput::builder()
+                        .set_successful(Some(
+                            ok.iter()
+                                .map(|e| {
+                                    DeleteMessageBatchResultEntry::builder()
+                                        .id(e.id())
+                                        .build()
+                                        .unwrap()
+                                })
+                                .collect(),
+                        ))
+                        .set_failed(Some(
+                            failed
+                                .iter()
+                                .map(|e| failure(e.id(), "ReceiptHandleIsInvalid"))
+                                .collect(),
+                        ))
+                        .build()
+                        .unwrap(),
+                )
+            });
+
+            let fake = self.clone();
+            let visibility =
+                mock!(Client::change_message_visibility_batch).then_compute_output(move |input| {
+                    let entries = input.entries();
+                    fake.visibility
+                        .lock()
+                        .unwrap()
+                        .extend(entries.iter().map(|e| {
+                            (
+                                e.receipt_handle().to_string(),
+                                e.visibility_timeout().unwrap_or_default(),
+                            )
+                        }));
+                    let (failed, ok): (Vec<_>, Vec<_>) = entries.iter().partition(|e| {
+                        fake.visibility_rejects.iter().any(|(h, secs)| {
+                            *h == e.receipt_handle() && Some(*secs) == e.visibility_timeout()
+                        })
+                    });
+                    ChangeMessageVisibilityBatchOutput::builder()
+                        .set_successful(Some(
+                            ok.iter()
+                                .map(|e| {
+                                    ChangeMessageVisibilityBatchResultEntry::builder()
+                                        .id(e.id())
+                                        .build()
+                                        .unwrap()
+                                })
+                                .collect(),
+                        ))
+                        .set_failed(Some(
+                            failed
+                                .iter()
+                                .map(|e| failure(e.id(), "ReceiptHandleIsInvalid"))
+                                .collect(),
+                        ))
+                        .build()
+                        .unwrap()
+                });
+
+            let client = mock_client!(
+                aws_sdk_sqs,
+                RuleMode::MatchAny,
+                &[&receive, &send, &delete, &visibility]
+            );
+            DeadLetterQueue {
+                config: aws_config::SdkConfig::builder().build(),
+                client,
+            }
+        }
+
+        fn sent(&self) -> Vec<Vec<String>> {
+            self.sent.lock().unwrap().clone()
+        }
+
+        fn visibility(&self) -> HashSet<(String, i32)> {
+            self.visibility.lock().unwrap().iter().cloned().collect()
+        }
+    }
+
+    fn failure(id: &str, code: &str) -> BatchResultErrorEntry {
+        BatchResultErrorEntry::builder()
+            .id(id)
+            .code(code)
+            .sender_fault(true)
+            .build()
+            .unwrap()
+    }
+
+    fn message(id: &str, handle: &str, group: Option<&str>) -> Message {
+        let mut builder = Message::builder()
+            .message_id(id)
+            .receipt_handle(handle)
+            .body(id);
+        if let Some(group) = group {
+            builder = builder.attributes(MessageSystemAttributeName::MessageGroupId, group);
+        }
+        builder.build()
+    }
+
+    fn held_and_released(handles: &[&str]) -> HashSet<(String, i32)> {
+        handles
+            .iter()
+            .flat_map(|h| [(h.to_string(), super::HOLD_SECONDS), (h.to_string(), 0)])
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn rejected_message_is_reported_held_and_released() {
+        let fake = Arc::new(Fake {
+            receives: Mutex::new(VecDeque::from([Some(vec![
+                message("m1", "h1", None),
+                message("m2", "h2", None),
+            ])])),
+            reject: ["m2"].into(),
+            ..Fake::default()
+        });
+
+        let summary = fake.dlq().redrive(SOURCE, DESTINATION, None).await.unwrap();
+
+        assert_eq!(summary.moved, 1);
+        assert_eq!(summary.rejected.len(), 1);
+        assert_eq!(summary.rejected[0].message_id, "m2");
+        assert_eq!(summary.rejected[0].error.code, "InvalidParameterValue");
+        assert!(summary.not_deleted.is_empty());
+        assert_eq!(fake.sent(), [["m1", "m2"]]);
+        assert_eq!(fake.visibility(), held_and_released(&["h2"]));
+    }
+
+    #[tokio::test]
+    async fn undeleted_message_is_reported_and_never_resent() {
+        // m2 is delivered but its delete fails. It then comes back (as if the hold
+        // expired in a long run) with a new receipt handle: it must be held again,
+        // not sent a second time.
+        let fake = Arc::new(Fake {
+            receives: Mutex::new(VecDeque::from([
+                Some(vec![message("m1", "h1", None), message("m2", "h2", None)]),
+                Some(vec![message("m2", "h2-again", None)]),
+            ])),
+            undeletable: ["h2"].into(),
+            ..Fake::default()
+        });
+
+        let summary = fake.dlq().redrive(SOURCE, DESTINATION, None).await.unwrap();
+
+        assert_eq!(summary.moved, 1);
+        assert!(summary.rejected.is_empty());
+        assert_eq!(summary.not_deleted.len(), 1);
+        assert_eq!(summary.not_deleted[0].message_id, "m2");
+        assert_eq!(fake.sent(), [["m1", "m2"]], "m2 was sent twice");
+        let visibility = fake.visibility();
+        assert!(visibility.contains(&("h2".into(), super::HOLD_SECONDS)));
+        assert!(visibility.contains(&("h2-again".into(), super::HOLD_SECONDS)));
+        // Released with the latest receipt handle.
+        assert!(visibility.contains(&("h2-again".into(), 0)));
+    }
+
+    #[tokio::test]
+    async fn fifo_group_stops_at_rejection_without_reordering() {
+        let fake = Arc::new(Fake {
+            receives: Mutex::new(VecDeque::from([Some(vec![
+                message("a1", "ha1", Some("a")),
+                message("a2", "ha2", Some("a")),
+                message("b1", "hb1", Some("b")),
+            ])])),
+            reject: ["a1"].into(),
+            ..Fake::default()
+        });
+        let source = format!("{SOURCE}.fifo");
+        let destination = format!("{DESTINATION}.fifo");
+
+        let summary = fake
+            .dlq()
+            .redrive(&source, &destination, None)
+            .await
+            .unwrap();
+
+        // a2 is never sent ahead of the rejected a1; group b is unaffected.
+        assert_eq!(fake.sent(), [vec!["a1"], vec!["b1"]]);
+        assert_eq!(summary.moved, 1);
+        assert_eq!(summary.blocked_groups, ["a"]);
+        assert_eq!(summary.rejected.len(), 1);
+        assert_eq!(fake.visibility(), held_and_released(&["ha1", "ha2"]));
+    }
+
+    #[tokio::test]
+    async fn held_messages_are_released_when_the_run_fails() {
+        let fake = Arc::new(Fake {
+            receives: Mutex::new(VecDeque::from([
+                Some(vec![message("m1", "h1", None)]),
+                None, // the next receive fails
+            ])),
+            reject: ["m1"].into(),
+            ..Fake::default()
+        });
+
+        let result = fake.dlq().redrive(SOURCE, DESTINATION, None).await;
+
+        let Err(Error::RedriveInterrupted { summary, source }) = result else {
+            panic!("expected RedriveInterrupted, got {result:?}");
+        };
+        assert!(matches!(*source, Error::Receive { .. }), "{source:?}");
+        assert_eq!(summary.rejected.len(), 1);
+        assert_eq!(fake.visibility(), held_and_released(&["h1"]));
+    }
+
+    #[tokio::test]
+    async fn failed_delete_request_reports_delivered_messages() {
+        // Both messages are delivered, then the whole delete request fails. The error
+        // must say they were delivered, and they must be held and released.
+        let fake = Arc::new(Fake {
+            receives: Mutex::new(VecDeque::from([Some(vec![
+                message("m1", "h1", None),
+                message("m2", "h2", None),
+            ])])),
+            delete_request_fails: true,
+            ..Fake::default()
+        });
+
+        let result = fake.dlq().redrive(SOURCE, DESTINATION, None).await;
+
+        let Err(Error::RedriveInterrupted { summary, source }) = result else {
+            panic!("expected RedriveInterrupted, got {result:?}");
+        };
+        assert!(matches!(*source, Error::DeleteBatch { .. }), "{source:?}");
+        assert_eq!(summary.moved, 0);
+        let not_deleted: Vec<_> = summary
+            .not_deleted
+            .iter()
+            .map(|f| f.message_id.as_str())
+            .collect();
+        assert_eq!(not_deleted, ["m1", "m2"]);
+        assert_eq!(summary.not_deleted_codes(), "DeleteRequestFailed");
+        assert_eq!(fake.visibility(), held_and_released(&["h1", "h2"]));
+    }
+
+    #[tokio::test]
+    async fn failed_release_is_reported_as_still_hidden() {
+        let fake = Arc::new(Fake {
+            receives: Mutex::new(VecDeque::from([Some(vec![message("m1", "h1", None)])])),
+            reject: ["m1"].into(),
+            visibility_rejects: [("h1", 0)].into(),
+            ..Fake::default()
+        });
+
+        let summary = fake.dlq().redrive(SOURCE, DESTINATION, None).await.unwrap();
+
+        assert_eq!(summary.rejected.len(), 1);
+        assert_eq!(summary.still_hidden, ["m1"]);
+    }
+
+    #[tokio::test]
+    async fn failed_hold_stops_the_run() {
+        // A message that can't be hidden would keep coming back forever.
+        let fake = Arc::new(Fake {
+            receives: Mutex::new(VecDeque::from([Some(vec![message("m1", "h1", None)])])),
+            reject: ["m1"].into(),
+            visibility_rejects: [("h1", super::HOLD_SECONDS)].into(),
+            ..Fake::default()
+        });
+
+        let result = fake.dlq().redrive(SOURCE, DESTINATION, None).await;
+
+        let Err(Error::RedriveInterrupted { source, .. }) = result else {
+            panic!("expected RedriveInterrupted, got {result:?}");
+        };
+        assert!(
+            matches!(*source, Error::PartialVisibilityChange { .. }),
+            "{source:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fifo_source_to_standard_destination_reports_blocked_group_accurately() {
+        // Order doesn't matter in a standard destination, but "later messages were not
+        // sent" must still be true for a blocked group.
+        let fake = Arc::new(Fake {
+            receives: Mutex::new(VecDeque::from([Some(vec![
+                message("a1", "ha1", Some("a")),
+                message("a2", "ha2", Some("a")),
+                message("b1", "hb1", Some("b")),
+            ])])),
+            reject: ["a1"].into(),
+            ..Fake::default()
+        });
+        let source = format!("{SOURCE}.fifo");
+
+        let summary = fake
+            .dlq()
+            .redrive(&source, DESTINATION, None)
+            .await
+            .unwrap();
+
+        assert_eq!(fake.sent(), [vec!["a1"], vec!["b1"]]);
+        assert_eq!(summary.blocked_groups, ["a"]);
+    }
+}

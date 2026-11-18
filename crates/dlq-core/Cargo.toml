@@ -6,6 +6,7 @@ authors.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+rust-version.workspace = true
 
 [lib]
 name = "dlq"
@@ -13,17 +14,15 @@ path = "src/lib.rs"
 
 [features]
 # Shared SQS test fixtures (ElasticMQ via testcontainers). Not part of the public API.
-test-utils = ["dep:testcontainers", "dep:testcontainers-modules"]
+test-utils = ["dep:testcontainers", "dep:testcontainers-modules", "dep:uuid"]
 
 [dependencies]
 tokio.workspace = true
 aws-config.workspace = true
 aws-sdk-sqs.workspace = true
-anyhow.workspace = true
+thiserror = "2"
 serde.workspace = true
-serde_json.workspace = true
-log.workspace = true
-uuid.workspace = true
+uuid = { workspace = true, optional = true }
 testcontainers = { workspace = true, optional = true }
 testcontainers-modules = { workspace = true, optional = true }
 
@@ -31,3 +30,6 @@ testcontainers-modules = { workspace = true, optional = true }
 # Enables `test-utils` for this crate's own unit and integration tests.
 dlq-core = { path = ".", features = ["test-utils"] }
 proptest = "1.12"
+# Scripted SQS responses for paths the emulator can't reproduce (partial failures).
+aws-smithy-mocks.workspace = true
+aws-sdk-sqs = { workspace = true, features = ["test-util"] }

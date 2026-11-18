@@ -8,7 +8,7 @@ use std::collections::HashSet;
 
 use dlq::test_utils::SqsTestEnv;
 use proptest::prelude::*;
-use proptest::test_runner::{Config, TestCaseError, TestRunner};
+use proptest::test_runner::{Config, FileFailurePersistence, TestCaseError, TestRunner};
 
 /// Default case count; override with `PROPTEST_CASES`.
 const CASES: u32 = 10;
@@ -23,6 +23,11 @@ fn check_roundtrip(strategy: impl Strategy<Value = Vec<String>>) {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(CASES),
+        // Save failing cases to tests/send.proptest-regressions. The default
+        // (SourceParallel) looks for lib.rs/main.rs, which integration tests don't have.
+        failure_persistence: Some(Box::new(FileFailurePersistence::WithSource(
+            "proptest-regressions",
+        ))),
         source_file: Some(file!()),
         ..Config::default()
     });
