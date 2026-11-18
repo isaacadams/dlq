@@ -56,7 +56,7 @@ left behind:
 
 - **Rejected** messages (with SQS error codes) stay in the source queue.
 - **FIFO groups** stop at their first rejected message; later messages in the group
-  are not sent, to keep order (some already in the same batch may have been).
+  are not sent, to keep order.
 - Messages **delivered but not deleted** are in both queues; redriving again would
   deliver them twice.
 

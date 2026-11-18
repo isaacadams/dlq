@@ -33,6 +33,7 @@ uuid = { version = "1.18", features = ["v4"] }
 # Test support (ElasticMQ provides a lightweight, license-free SQS emulator)
 testcontainers = "0.27"
 testcontainers-modules = { version = "0.15", features = ["elasticmq"] }
+aws-smithy-mocks = "0.3"
 
 # Prefer release-mode artifacts to keep disk usage down.
 # Scripts, aliases, and rust-analyzer are wired to --release; these

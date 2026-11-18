@@ -73,8 +73,9 @@ impl DeadLetterQueue {
     /// visible again at the end, so they are attempted once per run and the run ends
     /// when a long-poll receive finds nothing else, or `limit` messages have moved.
     /// For FIFO sources, a rejected message also stops the rest of its group (see
-    /// [`RedriveSummary::blocked_groups`]). Messages are sent up to 10 at a time, so
-    /// later messages of that group already in the same batch may still be delivered.
+    /// [`RedriveSummary::blocked_groups`]). When both queues are FIFO, a batch never
+    /// holds two messages from the same group, so nothing after a rejected message is
+    /// ever delivered ahead of it.
     ///
     /// AWS also offers server-side redrive (`StartMessageMoveTask`) for queues with a
     /// redrive policy; this method works for any pair of queues.
@@ -179,7 +180,8 @@ impl Redrive<'_> {
                 .partition(|m| self.held.contains_key(message_id(m)));
             self.hold(&again).await?;
 
-            for chunk in chunk_by_size(&fresh, MAX_BATCH_BYTES) {
+            let one_per_group = self.source_fifo && self.destination_fifo;
+            for chunk in chunk_messages(&fresh, MAX_BATCH_BYTES, one_per_group) {
                 self.move_chunk(&fresh[chunk]).await?;
             }
         }
@@ -387,18 +389,30 @@ fn classify<'m>(
 
 /// Splits messages into consecutive ranges whose estimated payload stays within
 /// `max_bytes` (and at most 10 entries). A single oversized message gets its own range.
-fn chunk_by_size(messages: &[Message], max_bytes: usize) -> Vec<Range<usize>> {
+///
+/// With `one_per_group`, a range never holds two messages from the same FIFO group, so
+/// if one is rejected, no later message of its group has been sent in the same request.
+fn chunk_messages(
+    messages: &[Message],
+    max_bytes: usize,
+    one_per_group: bool,
+) -> Vec<Range<usize>> {
     let mut chunks = Vec::new();
     let mut start = 0;
     let mut bytes = 0;
+    let mut groups: HashSet<&str> = HashSet::new();
     for (i, message) in messages.iter().enumerate() {
         let size = payload_size(message);
-        if i > start && (bytes + size > max_bytes || i - start == 10) {
+        let group = group_id(message).filter(|_| one_per_group);
+        let repeats_group = group.is_some_and(|g| groups.contains(g));
+        if i > start && (bytes + size > max_bytes || i - start == 10 || repeats_group) {
             chunks.push(start..i);
             start = i;
             bytes = 0;
+            groups.clear();
         }
         bytes += size;
+        groups.extend(group);
     }
     if start < messages.len() {
         chunks.push(start..messages.len());
@@ -512,14 +526,41 @@ mod unit_tests {
             .map(|(i, len)| message(&i.to_string(), *len))
             .collect();
         // 500-byte budget; the 600-byte message exceeds it on its own.
-        assert_eq!(chunk_by_size(&messages, 500), vec![0..3, 3..6, 6..7]);
+        assert_eq!(
+            chunk_messages(&messages, 500, false),
+            vec![0..3, 3..6, 6..7]
+        );
 
         let many: Vec<_> = (0..25).map(|i| message(&i.to_string(), 1)).collect();
         assert_eq!(
-            chunk_by_size(&many, usize::MAX),
+            chunk_messages(&many, usize::MAX, false),
             vec![0..10, 10..20, 20..25]
         );
-        assert!(chunk_by_size(&[], 500).is_empty());
+        assert!(chunk_messages(&[], 500, false).is_empty());
+    }
+
+    #[test]
+    fn fifo_chunks_hold_one_message_per_group() {
+        let grouped = |id: &str, group: &str| {
+            Message::builder()
+                .message_id(id)
+                .body("x")
+                .attributes(MessageSystemAttributeName::MessageGroupId, group)
+                .build()
+        };
+        let messages = [
+            grouped("a1", "a"),
+            grouped("b1", "b"),
+            grouped("a2", "a"),
+            grouped("c1", "c"),
+            grouped("a3", "a"),
+        ];
+        assert_eq!(
+            chunk_messages(&messages, usize::MAX, true),
+            vec![0..2, 2..4, 4..5]
+        );
+        // Without the FIFO rule, everything fits in one request.
+        assert_eq!(chunk_messages(&messages, usize::MAX, false), vec![0..5]);
     }
 
     #[test]
@@ -881,5 +922,299 @@ mod tests {
 
         env.dlq().purge(&queue_url).await.unwrap();
         assert!(env.receive_bodies(&queue_url, 1).await.is_empty());
+    }
+}
+
+/// Paths ElasticMQ can't reproduce (the destination rejecting individual messages,
+/// deletes failing, errors mid-run), driven through the real SDK client with scripted
+/// SQS responses. These clients have no `GetQueueAttributes` rule, so every test also
+/// checks that queues with different URLs are compared without an ARN lookup.
+#[cfg(test)]
+mod mock_tests {
+    use std::collections::{HashSet, VecDeque};
+    use std::sync::{Arc, Mutex};
+
+    use aws_sdk_sqs::Client;
+    use aws_sdk_sqs::operation::change_message_visibility_batch::ChangeMessageVisibilityBatchOutput;
+    use aws_sdk_sqs::operation::delete_message_batch::DeleteMessageBatchOutput;
+    use aws_sdk_sqs::operation::receive_message::{ReceiveMessageError, ReceiveMessageOutput};
+    use aws_sdk_sqs::operation::send_message_batch::SendMessageBatchOutput;
+    use aws_sdk_sqs::types::error::QueueDoesNotExist;
+    use aws_sdk_sqs::types::{
+        BatchResultErrorEntry, ChangeMessageVisibilityBatchResultEntry,
+        DeleteMessageBatchResultEntry, Message, MessageSystemAttributeName,
+        SendMessageBatchResultEntry,
+    };
+    use aws_smithy_mocks::{MockResponse, RuleMode, mock, mock_client};
+
+    use crate::{DeadLetterQueue, Error};
+
+    const SOURCE: &str = "https://sqs.us-east-1.amazonaws.com/123456789012/orders-dlq";
+    const DESTINATION: &str = "https://sqs.us-east-1.amazonaws.com/123456789012/orders";
+
+    /// Scripted SQS: receives come from `receives` (then empty); the destination rejects
+    /// `reject` bodies; deletes fail for `undeletable` receipt handles.
+    #[derive(Default)]
+    struct Fake {
+        receives: Mutex<VecDeque<Option<Vec<Message>>>>,
+        reject: HashSet<&'static str>,
+        undeletable: HashSet<&'static str>,
+        /// Bodies of each SendMessageBatch request.
+        sent: Mutex<Vec<Vec<String>>>,
+        /// (receipt handle, visibility timeout) of each visibility change.
+        visibility: Mutex<Vec<(String, i32)>>,
+    }
+
+    impl Fake {
+        fn dlq(self: &Arc<Self>) -> DeadLetterQueue {
+            let fake = self.clone();
+            let receive =
+                mock!(Client::receive_message).then_compute_response(move |_| {
+                    match fake.receives.lock().unwrap().pop_front() {
+                        Some(Some(messages)) => MockResponse::Output(
+                            ReceiveMessageOutput::builder()
+                                .set_messages(Some(messages))
+                                .build(),
+                        ),
+                        Some(None) => MockResponse::Error(ReceiveMessageError::QueueDoesNotExist(
+                            QueueDoesNotExist::builder().build(),
+                        )),
+                        None => MockResponse::Output(ReceiveMessageOutput::builder().build()),
+                    }
+                });
+
+            let fake = self.clone();
+            let send = mock!(Client::send_message_batch).then_compute_output(move |input| {
+                let entries = input.entries();
+                fake.sent.lock().unwrap().push(
+                    entries
+                        .iter()
+                        .map(|e| e.message_body().to_string())
+                        .collect(),
+                );
+                let (rejected, accepted): (Vec<_>, Vec<_>) = entries
+                    .iter()
+                    .partition(|e| fake.reject.contains(e.message_body()));
+                SendMessageBatchOutput::builder()
+                    .set_successful(Some(
+                        accepted
+                            .iter()
+                            .map(|e| {
+                                SendMessageBatchResultEntry::builder()
+                                    .id(e.id())
+                                    .message_id("new-id")
+                                    .md5_of_message_body("md5")
+                                    .build()
+                                    .unwrap()
+                            })
+                            .collect(),
+                    ))
+                    .set_failed(Some(
+                        rejected
+                            .iter()
+                            .map(|e| failure(e.id(), "InvalidParameterValue"))
+                            .collect(),
+                    ))
+                    .build()
+                    .unwrap()
+            });
+
+            let fake = self.clone();
+            let delete = mock!(Client::delete_message_batch).then_compute_output(move |input| {
+                let (failed, ok): (Vec<_>, Vec<_>) = input
+                    .entries()
+                    .iter()
+                    .partition(|e| fake.undeletable.contains(e.receipt_handle()));
+                DeleteMessageBatchOutput::builder()
+                    .set_successful(Some(
+                        ok.iter()
+                            .map(|e| {
+                                DeleteMessageBatchResultEntry::builder()
+                                    .id(e.id())
+                                    .build()
+                                    .unwrap()
+                            })
+                            .collect(),
+                    ))
+                    .set_failed(Some(
+                        failed
+                            .iter()
+                            .map(|e| failure(e.id(), "ReceiptHandleIsInvalid"))
+                            .collect(),
+                    ))
+                    .build()
+                    .unwrap()
+            });
+
+            let fake = self.clone();
+            let visibility =
+                mock!(Client::change_message_visibility_batch).then_compute_output(move |input| {
+                    let entries = input.entries();
+                    fake.visibility
+                        .lock()
+                        .unwrap()
+                        .extend(entries.iter().map(|e| {
+                            (
+                                e.receipt_handle().to_string(),
+                                e.visibility_timeout().unwrap_or_default(),
+                            )
+                        }));
+                    ChangeMessageVisibilityBatchOutput::builder()
+                        .set_successful(Some(
+                            entries
+                                .iter()
+                                .map(|e| {
+                                    ChangeMessageVisibilityBatchResultEntry::builder()
+                                        .id(e.id())
+                                        .build()
+                                        .unwrap()
+                                })
+                                .collect(),
+                        ))
+                        .set_failed(Some(vec![]))
+                        .build()
+                        .unwrap()
+                });
+
+            let client = mock_client!(
+                aws_sdk_sqs,
+                RuleMode::MatchAny,
+                &[&receive, &send, &delete, &visibility]
+            );
+            DeadLetterQueue {
+                config: aws_config::SdkConfig::builder().build(),
+                client,
+            }
+        }
+
+        fn sent(&self) -> Vec<Vec<String>> {
+            self.sent.lock().unwrap().clone()
+        }
+
+        fn visibility(&self) -> HashSet<(String, i32)> {
+            self.visibility.lock().unwrap().iter().cloned().collect()
+        }
+    }
+
+    fn failure(id: &str, code: &str) -> BatchResultErrorEntry {
+        BatchResultErrorEntry::builder()
+            .id(id)
+            .code(code)
+            .sender_fault(true)
+            .build()
+            .unwrap()
+    }
+
+    fn message(id: &str, handle: &str, group: Option<&str>) -> Message {
+        let mut builder = Message::builder()
+            .message_id(id)
+            .receipt_handle(handle)
+            .body(id);
+        if let Some(group) = group {
+            builder = builder.attributes(MessageSystemAttributeName::MessageGroupId, group);
+        }
+        builder.build()
+    }
+
+    fn held_and_released(handles: &[&str]) -> HashSet<(String, i32)> {
+        handles
+            .iter()
+            .flat_map(|h| [(h.to_string(), super::HOLD_SECONDS), (h.to_string(), 0)])
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn rejected_message_is_reported_held_and_released() {
+        let fake = Arc::new(Fake {
+            receives: Mutex::new(VecDeque::from([Some(vec![
+                message("m1", "h1", None),
+                message("m2", "h2", None),
+            ])])),
+            reject: ["m2"].into(),
+            ..Fake::default()
+        });
+
+        let summary = fake.dlq().redrive(SOURCE, DESTINATION, None).await.unwrap();
+
+        assert_eq!(summary.moved, 1);
+        assert_eq!(summary.rejected.len(), 1);
+        assert_eq!(summary.rejected[0].message_id, "m2");
+        assert_eq!(summary.rejected[0].error.code, "InvalidParameterValue");
+        assert!(summary.not_deleted.is_empty());
+        assert_eq!(fake.sent(), [["m1", "m2"]]);
+        assert_eq!(fake.visibility(), held_and_released(&["h2"]));
+    }
+
+    #[tokio::test]
+    async fn undeleted_message_is_reported_and_never_resent() {
+        // m2 is delivered but its delete fails. It then comes back (as if the hold
+        // expired in a long run) with a new receipt handle: it must be held again,
+        // not sent a second time.
+        let fake = Arc::new(Fake {
+            receives: Mutex::new(VecDeque::from([
+                Some(vec![message("m1", "h1", None), message("m2", "h2", None)]),
+                Some(vec![message("m2", "h2-again", None)]),
+            ])),
+            undeletable: ["h2"].into(),
+            ..Fake::default()
+        });
+
+        let summary = fake.dlq().redrive(SOURCE, DESTINATION, None).await.unwrap();
+
+        assert_eq!(summary.moved, 1);
+        assert!(summary.rejected.is_empty());
+        assert_eq!(summary.not_deleted.len(), 1);
+        assert_eq!(summary.not_deleted[0].message_id, "m2");
+        assert_eq!(fake.sent(), [["m1", "m2"]], "m2 was sent twice");
+        let visibility = fake.visibility();
+        assert!(visibility.contains(&("h2".into(), super::HOLD_SECONDS)));
+        assert!(visibility.contains(&("h2-again".into(), super::HOLD_SECONDS)));
+        // Released with the latest receipt handle.
+        assert!(visibility.contains(&("h2-again".into(), 0)));
+    }
+
+    #[tokio::test]
+    async fn fifo_group_stops_at_rejection_without_reordering() {
+        let fake = Arc::new(Fake {
+            receives: Mutex::new(VecDeque::from([Some(vec![
+                message("a1", "ha1", Some("a")),
+                message("a2", "ha2", Some("a")),
+                message("b1", "hb1", Some("b")),
+            ])])),
+            reject: ["a1"].into(),
+            ..Fake::default()
+        });
+        let source = format!("{SOURCE}.fifo");
+        let destination = format!("{DESTINATION}.fifo");
+
+        let summary = fake
+            .dlq()
+            .redrive(&source, &destination, None)
+            .await
+            .unwrap();
+
+        // a2 is never sent ahead of the rejected a1; group b is unaffected.
+        assert_eq!(fake.sent(), [vec!["a1"], vec!["b1"]]);
+        assert_eq!(summary.moved, 1);
+        assert_eq!(summary.blocked_groups, ["a"]);
+        assert_eq!(summary.rejected.len(), 1);
+        assert_eq!(fake.visibility(), held_and_released(&["ha1", "ha2"]));
+    }
+
+    #[tokio::test]
+    async fn held_messages_are_released_when_the_run_fails() {
+        let fake = Arc::new(Fake {
+            receives: Mutex::new(VecDeque::from([
+                Some(vec![message("m1", "h1", None)]),
+                None, // the next receive fails
+            ])),
+            reject: ["m1"].into(),
+            ..Fake::default()
+        });
+
+        let result = fake.dlq().redrive(SOURCE, DESTINATION, None).await;
+
+        assert!(matches!(result, Err(Error::Receive { .. })), "{result:?}");
+        assert_eq!(fake.visibility(), held_and_released(&["h1"]));
     }
 }
