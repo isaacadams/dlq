@@ -13,7 +13,7 @@ Ensure your AWS credentials are configured:
 
 | Flag | Description |
 |------|-------------|
-| `--local` | Use LocalStack mode (test credentials + `localhost:4566`) |
+| `--local` | Local emulator mode, e.g. ElasticMQ or LocalStack (test credentials + `localhost:4566`) |
 | `--endpoint <URL>` | Override AWS endpoint URL |
 
 ## Commands
@@ -79,8 +79,8 @@ dlq send-batch 1 https://sqs.us-east-1.amazonaws.com/123456789/my-queue
 # Dry run with limit
 dlq send-batch 1 https://sqs.us-east-1.amazonaws.com/123456789/my-queue --dry-run -n 100
 
-# With LocalStack
-dlq --local send-batch 1 http://sqs.us-east-1.localhost.localstack.cloud:4566/000000000000/demo
+# Against a local SQS emulator
+dlq --local send-batch 1 http://localhost:4566/000000000000/demo
 ```
 
 ### Job Management
@@ -141,12 +141,12 @@ Delete the SQLite database files.
 dlq database clean
 ```
 
-## LocalStack Development
+## Local Development
 
-For local development with LocalStack:
+For local development against the repo's ElasticMQ server (see `docker-compose.yml`):
 
 ```bash
-# Start LocalStack
+# Start a local SQS server on localhost:4566
 docker compose up -d
 
 # Create a queue
@@ -154,11 +154,11 @@ aws --endpoint-url=http://localhost:4566 sqs create-queue --queue-name demo
 
 # Use the CLI with --local flag
 dlq --local list
-dlq --local poll http://sqs.us-east-1.localhost.localstack.cloud:4566/000000000000/demo
+dlq --local poll http://localhost:4566/000000000000/demo
 
 # Seed and send test data
 dlq database seed test_job --items 1000 -p
-dlq --local send-batch 1 http://sqs.us-east-1.localhost.localstack.cloud:4566/000000000000/demo
+dlq --local send-batch 1 http://localhost:4566/000000000000/demo
 ```
 
 ## Environment Variables

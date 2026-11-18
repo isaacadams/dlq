@@ -3,7 +3,6 @@ $env.AWS_ENDPOINT_URL = "http://localhost:4566"
 # > nu scripts/dev.nu
 def main [] {
     docker compose down
-    mkdir .localstack
     docker compose up -d
     aws sqs create-queue --queue-name test
     main send messages 100 test
@@ -27,7 +26,7 @@ def message [id] {
     {Id: $id, MessageBody: $"Test Event ($id)"} | to json -r
 }
 
-# Send messages to the SQS queue in LocalStack
+# Send messages to the local SQS queue
 # Example usage:
 # > nu scripts/dev.nu send messages 100 test
 def "main send messages" [

@@ -117,7 +117,7 @@ mod tests {
         // Mock: Read initial data (one line), then error on next read
         let mock_reader = tokio_test::io::Builder::new()
             .read(b"first line\n".as_ref()) // ← Initial successful read
-            .read_error(std::io::Error::new(std::io::ErrorKind::Other, "mock error"))
+            .read_error(std::io::Error::other("mock error"))
             .build();
 
         let (handle, mut rx) = concurrent_lines(mock_reader, 1);
@@ -143,7 +143,5 @@ mod tests {
             .unwrap();
 
         assert!(result.is_ok());
-
-        ()
     }
 }

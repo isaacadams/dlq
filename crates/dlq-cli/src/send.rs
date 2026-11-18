@@ -10,8 +10,8 @@ use crate::database::Database;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use serde_json::Value;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Runs the interactive send mode.
 ///
@@ -120,7 +120,7 @@ async fn verify_queue_exists(client: &aws_sdk_sqs::Client, queue_url: &str) -> a
                     error_msg.push_str("No queues are currently available.\n\n");
                     error_msg.push_str("To create a new queue, you can use the AWS CLI:\n");
                     error_msg.push_str("  aws sqs create-queue --queue-name <your-queue-name>\n\n");
-                    error_msg.push_str("Or with LocalStack:\n");
+                    error_msg.push_str("Or against a local SQS emulator:\n");
                     error_msg.push_str("  aws --endpoint-url=http://localhost:4566 sqs create-queue --queue-name <your-queue-name>");
                 } else {
                     error_msg.push_str("Available queues:\n");
@@ -812,7 +812,7 @@ impl SqsBatch {
         }
     }
 
-    /// Create an SqsBatch configured for local development (e.g., LocalStack).
+    /// Create an SqsBatch configured for a local SQS emulator.
     /// Uses test credentials and localhost endpoint.
     /// Kept for test convenience.
     #[cfg(test)]
@@ -995,7 +995,7 @@ mod validation {
 #[cfg(test)]
 mod test {
     use crate::reader::concurrent_lines;
-    use crate::test::{create_test_queue, localstack};
+    use dlq::test_utils::SqsTestEnv;
 
     use super::*;
 
@@ -1139,16 +1139,14 @@ mod test {
     }
 
     // -------------------------------------------------------------------------
-    // SqsBatch Integration Tests (require LocalStack)
+    // SqsBatch Integration Tests (require Docker or DLQ_TEST_SQS_ENDPOINT)
     // -------------------------------------------------------------------------
 
     #[tokio::test]
     async fn test_local() {
-        // create a localstack container and a queue
-        let (endpoint, container) = localstack().await.unwrap();
-        let queue_url = create_test_queue(&container, "batch-send-test", false)
-            .await
-            .unwrap();
+        // start a local SQS server and create a queue
+        let env = SqsTestEnv::start().await;
+        let queue_url = env.create_queue("batch-send-test").await;
 
         // create a reader for the batch messages
         let reader = tokio::io::BufReader::new(std::io::Cursor::new(
@@ -1157,7 +1155,7 @@ mod test {
         let (handle, rx) = concurrent_lines(reader, 10);
 
         // create a sqs batch client and send the batch messages to the queue
-        let sqs = SqsBatch::local(&queue_url, Some(endpoint)).await;
+        let sqs = SqsBatch::local(&queue_url, Some(env.endpoint_url())).await;
         sqs.send(rx).await;
 
         // wait for the handle to complete to ensure the messages are sent
@@ -1186,37 +1184,33 @@ mod test {
         assert!(received_bodies.contains(&"first line"));
         assert!(received_bodies.contains(&"second line"));
         assert!(received_bodies.contains(&"third"));
-
-        container.stop().await.unwrap();
     }
 
     #[tokio::test]
     async fn test_verify_queue_exists_valid_queue() {
-        let (endpoint, container) = localstack().await.unwrap();
-        let queue_url = create_test_queue(&container, "exists-test", false)
-            .await
-            .unwrap();
+        let env = SqsTestEnv::start().await;
+        let queue_url = env.create_queue("exists-test").await;
 
-        let sqs = SqsBatch::local(&queue_url, Some(endpoint)).await;
+        let sqs = SqsBatch::local(&queue_url, Some(env.endpoint_url())).await;
         let client = aws_sdk_sqs::Client::new(&sqs.aws_config);
 
         // Should succeed for an existing queue
         let result = verify_queue_exists(&client, &queue_url).await;
         assert!(result.is_ok());
-
-        container.stop().await.unwrap();
     }
 
     #[tokio::test]
     async fn test_verify_queue_exists_invalid_queue() {
-        let (endpoint, container) = localstack().await.unwrap();
+        let env = SqsTestEnv::start().await;
 
         // Create a valid queue first (so we have available queues to list)
-        let _queue_url = create_test_queue(&container, "valid-queue", false)
-            .await
-            .unwrap();
+        let _queue_url = env.create_queue("valid-queue").await;
 
-        let sqs = SqsBatch::local("http://fake-queue-url/nonexistent", Some(endpoint)).await;
+        let sqs = SqsBatch::local(
+            "http://fake-queue-url/nonexistent",
+            Some(env.endpoint_url()),
+        )
+        .await;
         let client = aws_sdk_sqs::Client::new(&sqs.aws_config);
 
         // Should fail with helpful error message
@@ -1231,17 +1225,13 @@ mod test {
                 || error_msg.contains("Queue")
                 || error_msg.contains("verify")
         );
-
-        container.stop().await.unwrap();
     }
 
     #[tokio::test]
     async fn test_batch_send_multiple_batches() {
         // Test that messages are correctly batched (10 per batch)
-        let (endpoint, container) = localstack().await.unwrap();
-        let queue_url = create_test_queue(&container, "multi-batch-test", false)
-            .await
-            .unwrap();
+        let env = SqsTestEnv::start().await;
+        let queue_url = env.create_queue("multi-batch-test").await;
 
         // Create 25 messages (should be 3 batches: 10 + 10 + 5)
         let messages: Vec<String> = (0..25).map(|i| format!("message-{}", i)).collect();
@@ -1250,7 +1240,7 @@ mod test {
         let reader = tokio::io::BufReader::new(std::io::Cursor::new(input.into_bytes()));
         let (handle, rx) = concurrent_lines(reader, 100);
 
-        let sqs = SqsBatch::local(&queue_url, Some(endpoint)).await;
+        let sqs = SqsBatch::local(&queue_url, Some(env.endpoint_url())).await;
         sqs.send(rx).await;
         handle.await.unwrap();
 
@@ -1278,23 +1268,19 @@ mod test {
         }
 
         assert_eq!(all_messages.len(), 25);
-
-        container.stop().await.unwrap();
     }
 
     #[tokio::test]
     async fn test_empty_messages_filtered() {
-        let (endpoint, container) = localstack().await.unwrap();
-        let queue_url = create_test_queue(&container, "empty-filter-test", false)
-            .await
-            .unwrap();
+        let env = SqsTestEnv::start().await;
+        let queue_url = env.create_queue("empty-filter-test").await;
 
         // Input with empty lines that should be filtered
         let input = b"valid1\n\n\nvalid2\n\n".to_vec();
         let reader = tokio::io::BufReader::new(std::io::Cursor::new(input));
         let (handle, rx) = concurrent_lines(reader, 10);
 
-        let sqs = SqsBatch::local(&queue_url, Some(endpoint)).await;
+        let sqs = SqsBatch::local(&queue_url, Some(env.endpoint_url())).await;
         sqs.send(rx).await;
         handle.await.unwrap();
 
@@ -1314,7 +1300,5 @@ mod test {
         let bodies: Vec<&str> = messages.iter().filter_map(|m| m.body()).collect();
         assert!(bodies.contains(&"valid1"));
         assert!(bodies.contains(&"valid2"));
-
-        container.stop().await.unwrap();
     }
 }

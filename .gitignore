@@ -1,5 +1,4 @@
 /target
-.localstack
 *.db
 *.db-shm
 *.db-wal

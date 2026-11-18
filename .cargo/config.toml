@@ -11,7 +11,7 @@ r = ["run", "--release"]
 rr = ["run", "--release"]
 t = ["test", "--release"]
 tr = ["test", "--release"]
-tidy = ["clippy", "--release", "--", "-D", "warnings"]
+tidy = ["clippy", "--release", "--workspace", "--all-targets", "--", "-D", "warnings"]
 
 [build]
 # Incremental compilation caches are a major source of target/ disk growth.

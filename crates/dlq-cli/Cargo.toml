@@ -1,11 +1,11 @@
 [package]
 name = "dlq"
-authors = ["Isaac Adams"]
-version = "1.1.0"
-edition = "2021"
-license = "MIT"
+version = "1.2.0"
 description = "a CLI tool for polling the messages from your AWS DLQ instance"
-repository = "https://github.com/isaacadams/dlq"
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
 
 [[bin]]
 name = "dlq"
@@ -13,25 +13,23 @@ path = "src/main.rs"
 
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "parking_lot"]}
-aws-config = { version = "1.5", features = ["behavior-version-latest"] }
-aws-sdk-sqs = "1"
-log = "0.4"
-env_logger = "0.11"
-anyhow = "1.0"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-dlq-core = { version = "1.0.1", path = "../dlq-core" }
+tokio.workspace = true
+aws-config.workspace = true
+aws-sdk-sqs.workspace = true
+log.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+dlq-core = { version = "2.0.0", path = "../dlq-core" }
 pumps = "0.1"
-uuid = { version = "1.18", features = ["v4"] }
+uuid.workspace = true
 tracing = "0.1"
-sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "sqlite", "chrono", "json"] }
+sqlx = { version = "0.9", features = ["runtime-tokio", "sqlite", "chrono", "json"] }
 indicatif = "0.18"
 async-channel = "2"
 
 [dev-dependencies]
-assert_cmd = "2.0"
+dlq-core = { path = "../dlq-core", features = ["test-utils"] }
+assert_cmd = "2.2"
 predicates = "3.1"
-testcontainers = "0.26"
-testcontainers-modules = { version = "0.14", features = ["localstack"] }
 tokio-test = "0.4.4"

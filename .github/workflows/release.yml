@@ -1,0 +1,133 @@
+name: Release
+
+# release-plz keeps a "release PR" open with version bumps and changelogs. Merging it
+# publishes new versions to crates.io, tags them, creates GitHub releases, and (for the
+# `dlq` CLI) attaches prebuilt binaries.
+#
+# One-time setup:
+#   - crates.io: add this repo + workflow (release.yml) as a Trusted Publisher for both
+#     `dlq` and `dlq-core` (crate settings -> Trusted Publishing). No API token is stored.
+#   - GitHub: Settings -> Actions -> General -> "Allow GitHub Actions to create and
+#     approve pull requests".
+
+on:
+  push:
+    branches: ['main']
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release:
+    name: Publish unreleased versions
+    runs-on: ubuntu-latest
+    if: github.repository_owner == 'isaacadams'
+    permissions:
+      contents: write # tags and GitHub releases
+      id-token: write # crates.io trusted publishing
+    outputs:
+      releases: ${{ steps.release-plz.outputs.releases }}
+      releases_created: ${{ steps.release-plz.outputs.releases_created }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Authenticate with crates.io
+        id: crates-io-auth
+        uses: rust-lang/crates-io-auth-action@v1
+
+      - name: Run release-plz
+        id: release-plz
+        uses: release-plz/action@v0.5
+        with:
+          command: release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CARGO_REGISTRY_TOKEN: ${{ steps.crates-io-auth.outputs.token }}
+
+  release-pr:
+    name: Update release PR
+    runs-on: ubuntu-latest
+    if: github.repository_owner == 'isaacadams'
+    permissions:
+      contents: write
+      pull-requests: write
+    concurrency:
+      group: release-plz-${{ github.ref }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Run release-plz
+        uses: release-plz/action@v0.5
+        with:
+          command: release-pr
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  binaries:
+    name: Binaries (${{ matrix.target }})
+    needs: release
+    # Only when this run released the `dlq` CLI crate.
+    if: needs.release.outputs.releases_created == 'true' && contains(fromJSON(needs.release.outputs.releases).*.package_name, 'dlq')
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: x86_64-unknown-linux-gnu, os: ubuntu-latest }
+          - { target: aarch64-unknown-linux-gnu, os: ubuntu-24.04-arm }
+          - { target: x86_64-apple-darwin, os: macos-latest }
+          - { target: aarch64-apple-darwin, os: macos-latest }
+          - { target: x86_64-pc-windows-msvc, os: windows-latest }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --locked -p dlq --target ${{ matrix.target }}
+
+      - name: Package and upload
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASES: ${{ needs.release.outputs.releases }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          tag=$(jq -r '.[] | select(.package_name == "dlq") | .tag' <<< "$RELEASES")
+          name="dlq-${tag#dlq-}-${TARGET}"
+          mkdir "$name"
+          cp README.md LICENSE "$name/"
+          if [[ "$TARGET" == *windows* ]]; then
+            cp "target/$TARGET/release/dlq.exe" "$name/"
+            7z a "$name.zip" "$name" > /dev/null
+            archive="$name.zip"
+          else
+            cp "target/$TARGET/release/dlq" "$name/"
+            tar czf "$name.tar.gz" "$name"
+            archive="$name.tar.gz"
+          fi
+          shasum -a 256 "$archive" > "$archive.sha256"
+          gh release upload "$tag" "$archive" "$archive.sha256" --clobber

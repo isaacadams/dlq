@@ -108,52 +108,30 @@ impl DeadLetterQueue {
 
 #[cfg(test)]
 mod tests {
-    use crate::test_utils::TestEnv;
+    use crate::test_utils::SqsTestEnv;
 
     #[tokio::test]
     async fn test_send_batch_success() {
-        let env = TestEnv::new(None).await.unwrap();
-        let queue_name = env.create_sqs_queue("test-batch").await.unwrap();
-        let queue_url = env.queue_url(&queue_name);
-        let dlq = env.dlq();
+        let env = SqsTestEnv::start().await;
+        let queue_url = env.create_queue("test-batch").await;
 
         let messages = vec!["message1", "message2", "message3"];
-        let result = dlq.send_batch(&queue_url, &messages).await;
-
+        let result = env.dlq().send_batch(&queue_url, &messages).await;
         assert!(result.is_ok(), "send_batch should succeed");
 
         // Verify messages were actually sent by receiving them
-        let receive_output = env
-            .client()
-            .receive_message()
-            .queue_url(&queue_url)
-            .max_number_of_messages(10)
-            .send()
-            .await
-            .unwrap();
-
-        let received_messages = receive_output.messages.unwrap_or_default();
-        assert_eq!(received_messages.len(), 3, "Should receive 3 messages");
-
-        let received_bodies: Vec<&str> = received_messages
-            .iter()
-            .map(|m| m.body().unwrap_or(""))
-            .collect();
-
-        assert!(received_bodies.contains(&"message1"));
-        assert!(received_bodies.contains(&"message2"));
-        assert!(received_bodies.contains(&"message3"));
+        let mut received = env.receive_bodies(&queue_url, 3).await;
+        received.sort();
+        assert_eq!(received, ["message1", "message2", "message3"]);
     }
 
     #[tokio::test]
     async fn test_send_batch_empty() {
-        let env = TestEnv::new(None).await.unwrap();
-        let queue_name = env.create_sqs_queue("test-empty").await.unwrap();
-        let queue_url = env.queue_url(&queue_name);
-        let dlq = env.dlq();
+        let env = SqsTestEnv::start().await;
+        let queue_url = env.create_queue("test-empty").await;
 
         let messages: Vec<String> = vec![];
-        let result = dlq.send_batch(&queue_url, &messages).await;
+        let result = env.dlq().send_batch(&queue_url, &messages).await;
 
         assert!(result.is_ok(), "send_batch should handle empty batch");
     }

@@ -1,18 +1,12 @@
+# Local SQS for development and tests.
+#   docker compose up -d
+#   dlq --local list
+#   DLQ_TEST_SQS_ENDPOINT=http://localhost:4566 cargo nextest run --release
 services:
-  localstack:
-    container_name: localstack-sqs
-    image: localstack/localstack:latest          # or localstack/localstack:3.8 for stability
+  sqs:
+    container_name: dlq-sqs
+    image: softwaremill/elasticmq-native:1.7.1 # SQS-compatible, no license or auth token needed
     ports:
-      - "4566:4566"            # LocalStack edge port (all AWS services)
-      - "4571:4571"            # Web UI (optional)
-    environment:
-      - SERVICES=sqs:4576,s3           # only start SQS (faster + cheaper)
-      - DEFAULT_REGION=us-east-1
-      - DEBUG=1
+      - "4566:9324" # keep the 4566 port that `dlq --local` defaults to
     volumes:
-      - '/var/run/docker.sock:/var/run/docker.sock'
-    healthcheck:
-      test: ["CMD", "awslocal", "sqs", "list-queues"]
-      interval: 30s
-      timeout: 60s
-      retries: 10
+      - ./.config/elasticmq.conf:/opt/elasticmq.conf:ro

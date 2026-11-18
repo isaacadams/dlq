@@ -6,16 +6,26 @@ on:
   pull_request:
     branches: ['main']
 
+permissions:
+  contents: read
+
+# Cancel superseded runs on the same branch/PR.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: short
 
 jobs:
-  checks:
-    name: Formatting, Linting, and Build
+  # One job so lint, build, and tests share a single compile and cache.
+  ci:
+    name: Lint and Test
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -25,72 +35,24 @@ jobs:
       - name: Rust Cache
         uses: Swatinem/rust-cache@v2
 
+      - name: Install nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+
       - name: Check formatting
         run: cargo fmt --all -- --check
 
       - name: Clippy
-        run: cargo clippy -- -D warnings
+        run: cargo clippy --workspace --all-targets -- -D warnings
 
-      - name: Build
-        run: cargo b
+      # SQS tests start their own ElasticMQ containers via testcontainers (Docker is
+      # preinstalled on ubuntu-latest). Pre-pull so the pull isn't charged to a test.
+      - name: Pull ElasticMQ image
+        run: docker pull softwaremill/elasticmq-native:1.7.1
 
-  unit-tests:
-    name: Unit Tests
-    runs-on: ubuntu-latest
+      - name: Tests
+        run: cargo nextest run --workspace --all-targets --profile ci
 
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Rust Cache
-        uses: Swatinem/rust-cache@v2
-
-      - name: Install nextest
-        uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-nextest
-
-      - name: Run unit tests
-        run: cargo nextest run --workspace --lib --profile ci
-
-  integration-tests:
-    name: Integration Tests
-    runs-on: ubuntu-latest
-
-    services:
-      localstack:
-        image: localstack/localstack:latest
-        env:
-          SERVICES: sqs
-          DEFAULT_REGION: us-east-1
-        ports:
-          - 4566:4566
-        options: >-
-          --health-cmd "awslocal sqs list-queues || exit 1"
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Rust Cache
-        uses: Swatinem/rust-cache@v2
-
-      - name: Install nextest
-        uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-nextest
-
-      - name: Run integration tests
-        run: cargo nextest run --workspace --test '*' --profile ci
-        env:
-          AWS_ENDPOINT_URL: http://localhost:4566
-          AWS_REGION: us-east-1
-          AWS_ACCESS_KEY_ID: test
-          AWS_SECRET_ACCESS_KEY: test
+      - name: Doctests
+        run: cargo test --workspace --doc

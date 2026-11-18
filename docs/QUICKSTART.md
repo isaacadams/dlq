@@ -1,6 +1,7 @@
 # Local Development Quickstart
 
-This guide walks through setting up a local development environment using LocalStack.
+This guide walks through setting up a local development environment using
+[ElasticMQ](https://github.com/softwaremill/elasticmq), a lightweight SQS-compatible server.
 
 ## Prerequisites
 
@@ -10,18 +11,17 @@ This guide walks through setting up a local development environment using LocalS
 
 ## Setup
 
-### 1. Start LocalStack
+### 1. Start the Local SQS Server
 
 ```bash
 docker compose up -d
 ```
 
-This starts LocalStack with SQS enabled on `localhost:4566`.
+This starts ElasticMQ on `localhost:4566`, the endpoint `dlq --local` uses by default.
 
 ### 2. Create a Test Queue
 
 ```bash
-# Using the localstack profile (if configured) or with explicit endpoint
 aws --endpoint-url=http://localhost:4566 sqs create-queue --queue-name demo
 ```
 
@@ -44,7 +44,7 @@ This workspace prefers **release** builds. Prefer `cargo build --release` /
 cargo run --release -- database seed send_batch --items 10000 -p
 
 # Send items to the queue
-cargo run --release -- --local send-batch 1 "http://sqs.us-east-1.localhost.localstack.cloud:4566/000000000000/demo"
+cargo run --release -- --local send-batch 1 "http://localhost:4566/000000000000/demo"
 
 # Check job status
 cargo run --release -- job status 1
@@ -54,7 +54,7 @@ cargo run --release -- job status 1
 
 ```bash
 # Poll messages from the queue
-cargo run --release -- --local poll "http://sqs.us-east-1.localhost.localstack.cloud:4566/000000000000/demo"
+cargo run --release -- --local poll "http://localhost:4566/000000000000/demo"
 ```
 
 ### Loading Custom Data
@@ -68,7 +68,7 @@ echo '{"id": 2, "message": "world"}' >> items.jsonl
 cargo run --release -- job load --name my-job items.jsonl
 
 # Send to queue
-cargo run --release -- --local send-batch 1 "http://sqs.us-east-1.localhost.localstack.cloud:4566/000000000000/demo"
+cargo run --release -- --local send-batch 1 "http://localhost:4566/000000000000/demo"
 ```
 
 ## Cleanup
@@ -77,7 +77,7 @@ cargo run --release -- --local send-batch 1 "http://sqs.us-east-1.localhost.loca
 # Remove database files
 cargo run --release -- database clean
 
-# Stop LocalStack
+# Stop the local SQS server
 docker compose down
 ```
 
@@ -85,14 +85,14 @@ docker compose down
 
 ### Queue URL Format
 
-LocalStack queue URLs follow this format:
+Local queue URLs follow this format:
 ```
-http://sqs.us-east-1.localhost.localstack.cloud:4566/000000000000/<queue-name>
+http://localhost:4566/000000000000/<queue-name>
 ```
 
 ### Connection Issues
 
-If you can't connect to LocalStack:
+If you can't connect to the local SQS server:
 1. Ensure Docker is running: `docker ps`
-2. Check LocalStack logs: `docker compose logs localstack`
-3. Verify the port is accessible: `curl http://localhost:4566/_localstack/health`
+2. Check the server logs: `docker compose logs sqs`
+3. Verify the port is accessible: `aws --endpoint-url=http://localhost:4566 sqs list-queues`
